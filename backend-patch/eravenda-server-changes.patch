@@ -1,0 +1,1816 @@
+diff -ruN a/backend/app/account_deletion.py b/backend/app/account_deletion.py
+--- a/backend/app/account_deletion.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/account_deletion.py	2026-11-06 07:34:56.334092603 +0000
+@@ -0,0 +1,191 @@
++"""Account deletion by anonymisation.
++
++Why not a hard delete?  Orders reference the buyer, the store and the delivery address, and payments reference the
++order. The business has to keep those records (tax, accounting, disputes; the privacy policy says up to six years),
++and the database rightly refuses to delete a user who has them (the admin "delete user" endpoint fails for the same reason).
++
++So deleting an account means:
++  * REMOVED: saved addresses not used by an order, cart, wishlist, store follows, store blocks, push tokens, notification
++    preferences, newsletter signup and contact-form messages sent from the account's email, review comments,
++    and every personal field on the user (name, email, phone, password, sign-in links, avatar, location).
++  * ANONYMISED: addresses used by past orders (name and phone blanked, street-level details removed),
++    the seller's store (renamed "Closed store", description/logo/banner/registration number removed, suspended)
++    and its products (hidden, stock 0).
++  * KEPT: the user row itself (as "Deleted user", inactive, unable to sign in), orders, order items, payments,
++    receipts, review ratings (so product rating averages stay honest), payout records and content reports the user
++    filed (moderation records; they keep pointing at the anonymised user).
++
++Nothing here commits: the caller commits once so the whole deletion succeeds or fails together.
++"""
++
++import logging
++import threading
++
++from sqlalchemy import func  # type: ignore[reportMissingImports]
++
++from . import models
++from .email_utils import SITE_URL, send_email
++
++logger = logging.getLogger("eravenda.account_deletion")
++
++DELETED_NAME = "Deleted user"
++ACTIVE_ORDER_STATUSES = (
++    models.OrderStatus.pending,
++    models.OrderStatus.paid,
++    models.OrderStatus.processing,
++    models.OrderStatus.shipped,
++)
++FINISHED_BOOKINGS = (models.ServiceBookingStatus.released, models.ServiceBookingStatus.cancelled)
++OPEN_PAYOUTS = (models.PayoutStatus.pending, models.PayoutStatus.processing)
++
++
++def _plural(n: int, word: str) -> str:
++    return f"{n} {word}" + ("" if n == 1 else "s")
++
++
++def deletion_blockers(db, user) -> list[str]:
++    """Plain-language reasons this account cannot be deleted right now (empty list = it can)."""
++    role = user.role.value if hasattr(user.role, "value") else str(user.role)
++    if role not in ("buyer", "seller"):
++        return ["This type of account can't be deleted in the app. Please contact EraVenda support."]
++
++    has_profile = (
++        db.query(models.DeliveryProfile.id).filter(models.DeliveryProfile.user_id == user.id).first()
++        or db.query(models.HandymanProfile.id).filter(models.HandymanProfile.user_id == user.id).first()
++    )
++    if has_profile:
++        return ["This account has a delivery or professional-services profile. Please contact EraVenda support to close it."]
++
++    blockers: list[str] = []
++
++    buying = db.query(func.count(models.Order.id)).filter(
++        models.Order.buyer_id == user.id, models.Order.status.in_(ACTIVE_ORDER_STATUSES)
++    ).scalar() or 0
++    if buying:
++        blockers.append(
++            f"You have {_plural(buying, 'order')} in progress. Cancel any unpaid orders, "
++            "or wait until they are delivered or cancelled."
++        )
++
++    bookings = db.query(func.count(models.ServiceBooking.id)).filter(
++        models.ServiceBooking.client_id == user.id, models.ServiceBooking.status.notin_(FINISHED_BOOKINGS)
++    ).scalar() or 0
++    if bookings:
++        blockers.append(f"You have {_plural(bookings, 'service booking')} that isn't finished yet.")
++
++    store = db.query(models.Store).filter(models.Store.owner_id == user.id).first()
++    if store:
++        selling = db.query(func.count(models.Order.id)).filter(
++            models.Order.store_id == store.id, models.Order.status.in_(ACTIVE_ORDER_STATUSES)
++        ).scalar() or 0
++        if selling:
++            blockers.append(
++                f"Your store has {_plural(selling, 'order')} in progress. "
++                "Finish or cancel them before deleting your account."
++            )
++        payouts = db.query(func.count(models.Payout.id)).filter(
++            models.Payout.store_id == store.id, models.Payout.status.in_(OPEN_PAYOUTS)
++        ).scalar() or 0
++        if payouts:
++            blockers.append(f"Your store has {_plural(payouts, 'payout')} still being processed.")
++    return blockers
++
++
++def anonymize_account(db, user) -> None:
++    """Apply the rules in the module docstring. Does NOT commit."""
++    email = (user.email or "").strip().lower()
++
++    # --- addresses: orders keep pointing at theirs, so scrub those and delete the rest
++    used = {row[0] for row in db.query(models.Order.address_id).filter(models.Order.buyer_id == user.id).all()}
++    for address in db.query(models.Address).filter(models.Address.user_id == user.id).all():
++        if address.id in used:
++            address.label = None
++            address.recipient_name = DELETED_NAME
++            address.phone = "-"
++            address.area = None
++            address.sub_town = None
++            address.landmark = None
++            address.is_default = False
++        else:
++            db.delete(address)
++
++    # --- cart (items cascade), wishlist, device + preference rows
++    cart = db.query(models.Cart).filter(models.Cart.user_id == user.id).first()
++    if cart:
++        db.delete(cart)
++    db.query(models.Wishlist).filter(models.Wishlist.user_id == user.id).delete(synchronize_session=False)
++    db.query(models.DeviceToken).filter(models.DeviceToken.user_id == user.id).delete(synchronize_session=False)
++    db.query(models.StoreBlock).filter(models.StoreBlock.user_id == user.id).delete(synchronize_session=False)
++    db.query(models.NotificationPreference).filter(models.NotificationPreference.user_id == user.id).delete(synchronize_session=False)
++
++    # --- store follows, then keep each store's denormalised follower_count honest
++    followed = [row[0] for row in db.query(models.StoreFollow.store_id).filter(models.StoreFollow.user_id == user.id).all()]
++    db.query(models.StoreFollow).filter(models.StoreFollow.user_id == user.id).delete(synchronize_session=False)
++    for store_id in followed:
++        store = db.query(models.Store).filter(models.Store.id == store_id).first()
++        if store:
++            store.follower_count = db.query(func.count(models.StoreFollow.id)).filter(models.StoreFollow.store_id == store_id).scalar() or 0
++
++    # --- review comments can contain personal details; the star rating stays so averages are not rewritten
++    db.query(models.Review).filter(models.Review.buyer_id == user.id).update({"comment": None}, synchronize_session=False)
++
++    # --- records keyed only by email address
++    if email:
++        db.query(models.NewsletterSubscriber).filter(func.lower(models.NewsletterSubscriber.email) == email).delete(synchronize_session=False)
++        db.query(models.ContactMessage).filter(func.lower(models.ContactMessage.email) == email).delete(synchronize_session=False)
++
++    # --- the seller's store and products
++    store = db.query(models.Store).filter(models.Store.owner_id == user.id).first()
++    if store:
++        db.query(models.Product).filter(models.Product.store_id == store.id).update(
++            {"status": models.ProductStatus.out_of_stock, "stock_quantity": 0}, synchronize_session=False
++        )
++        store.store_name = "Closed store"
++        store.slug = f"closed-{store.id[:8]}"
++        store.description = None
++        store.logo_url = None
++        store.banner_url = None
++        store.business_registration_number = None
++        store.sub_town = None
++        store.status = models.StoreStatus.suspended
++        store.rejection_reason = "Account deleted by its owner"
++
++    # --- finally the person: the row stays (orders point at it) but identifies nobody and cannot sign in
++    user.full_name = DELETED_NAME
++    user.email = f"deleted-{user.id}@deleted.eravenda.invalid"
++    user.phone = None
++    user.password_hash = None
++    user.oauth_provider = None
++    user.oauth_sub = None
++    user.avatar_url = None
++    user.region = None
++    user.city = None
++    user.sub_town = None
++    user.is_active = False
++    user.is_verified = False
++
++
++def send_goodbye_email(to: str, first_name: str) -> None:
++    """Confirmation to the ORIGINAL address (it is gone from the account by now). Background thread, never raises."""
++    if not to:
++        return
++
++    def run():
++        try:
++            send_email(
++                to=to,
++                subject="Your EraVenda account has been deleted",
++                body=(
++                    f"Hi {first_name or 'there'},\n\n"
++                    "Your EraVenda account has been deleted and your personal details have been removed.\n\n"
++                    "We keep order and payment records for as long as the law requires, without your name or contact details "
++                    "linked to your account. Your saved addresses, wishlist, cart and notification settings are gone.\n\n"
++                    "If you did not ask for this, contact us right away:\n"
++                    f"{SITE_URL}/contact\n\n"
++                    "Thank you for using EraVenda.\n"
++                ),
++            )
++        except Exception:
++            logger.exception("Could not send the account-deletion confirmation email")
++
++    threading.Thread(target=run, daemon=True).start()
+diff -ruN a/backend/app/main.py b/backend/app/main.py
+--- a/backend/app/main.py	2026-11-06 07:34:56.321097620 +0000
++++ b/backend/app/main.py	2026-11-06 07:34:56.329865816 +0000
+@@ -30,7 +30,7 @@
+ from .migrate import run_migrations
+ from . import models, security, cache  # noqa: F401 - registers models on Base before create_all
+ from . import auth as auth_core
+-from .routers import auth, products, categories, cart, orders, stores, admin, users, payments, contact, wishlist, services, reviews, delivery, newsletter, import_products, monetization, analytics, broadcasts
++from .routers import auth, products, categories, cart, orders, stores, admin, users, payments, contact, wishlist, services, reviews, delivery, newsletter, import_products, monetization, analytics, broadcasts, devices, notification_preferences, account_deletion, moderation
+ from .platform_settings import get_settings, pinned_product_ids
+ from .home_feed import fair_random_products, live_promoted_products
+ from .database import SessionLocal
+@@ -249,6 +249,11 @@
+ app.include_router(payments.router, prefix="/api")
+ app.include_router(contact.router, prefix="/api")
+ app.include_router(wishlist.router, prefix="/api")
++app.include_router(devices.router, prefix="/api")
++app.include_router(notification_preferences.router, prefix="/api")
++app.include_router(account_deletion.router, prefix="/api")
++app.include_router(moderation.router, prefix="/api")
++app.include_router(moderation.admin_router, prefix="/api")
+ app.include_router(services.router, prefix="/api")
+ app.include_router(reviews.router, prefix="/api")
+ app.include_router(delivery.router, prefix="/api")
+@@ -1012,6 +1017,12 @@
+     return templates.TemplateResponse(request, "delivery-terms.html", page_context(request, db))
+ 
+ 
++@app.get("/delete-account", response_class=HTMLResponse)
++def delete_account_page(request: Request, db: Session = Depends(get_db)):
++    """Public page explaining how to delete an account (Google Play requires a web link for this)."""
++    return templates.TemplateResponse(request, "delete-account.html", page_context(request, db))
++
++
+ @app.get("/privacy", response_class=HTMLResponse)
+ def privacy_page(request: Request, db: Session = Depends(get_db)):
+     return templates.TemplateResponse(request, "privacy.html", page_context(request, db))
+@@ -1097,6 +1108,13 @@
+     return templates.TemplateResponse(request, "admin/dashboard.html", page_context(request, db))
+ 
+ 
++@app.get("/admin/reports.html", response_class=HTMLResponse)
++def admin_reports_page(request: Request, db: Session = Depends(get_db)):
++    if (blocked := _admin_page_gate(request, db)) is not None:
++        return blocked
++    return templates.TemplateResponse(request, "admin/reports.html", page_context(request, db))
++
++
+ @app.get("/admin/stats.html", response_class=HTMLResponse)
+ def admin_stats_page(request: Request, db: Session = Depends(get_db)):
+     if (blocked := _admin_page_gate(request, db)) is not None:
+diff -ruN a/backend/app/models.py b/backend/app/models.py
+--- a/backend/app/models.py	2026-11-06 07:34:56.325280130 +0000
++++ b/backend/app/models.py	2026-11-06 07:34:56.333109936 +0000
+@@ -310,6 +310,59 @@
+     product = relationship("Product", back_populates="wishlisted_by", lazy="selectin")
+ 
+ 
++class ContentReport(Base):
++    """A user's report of a product, store or review (see routers/moderation.py).
++    Reports outlive the reporter's account on purpose: they are moderation records."""
++    __tablename__ = "content_reports"
++
++    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
++    reporter_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
++    target_type = Column(String(20), nullable=False)  # product | store | review
++    target_id = Column(String(40), nullable=False)
++    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id", ondelete="SET NULL"), nullable=True)  # store involved, for admins
++    reason = Column(String(30), nullable=False)
++    details = Column(Text)
++    status = Column(String(20), nullable=False, default="open", index=True)  # open | reviewing | actioned | dismissed
++    admin_note = Column(Text)
++    reviewed_by = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
++    reviewed_at = Column(DateTime, nullable=True)
++    created_at = Column(DateTime, default=datetime.utcnow, index=True)
++
++
++class StoreBlock(Base):
++    """A buyer chose to hide a store. The mobile app filters these stores out of the buyer's own views."""
++    __tablename__ = "store_blocks"
++    __table_args__ = (UniqueConstraint("user_id", "store_id", name="uq_store_block_user_store"),)
++
++    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
++    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
++    store_id = Column(UUID(as_uuid=False), ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
++    created_at = Column(DateTime, default=datetime.utcnow)
++
++
++class NotificationPreference(Base):
++    """One row per user, created the first time they change a setting. No row means "everything on"."""
++    __tablename__ = "notification_preferences"
++
++    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
++    order_updates_email = Column(Boolean, nullable=False, default=True)  # buyer: status emails
++    order_updates_push = Column(Boolean, nullable=False, default=True)   # buyer: status pushes
++    seller_orders_push = Column(Boolean, nullable=False, default=True)   # seller: new order / paid / cancelled pushes
++    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
++class DeviceToken(Base):
++    """An Expo push token for one installed copy of the mobile app (see push.py)."""
++    __tablename__ = "device_tokens"
++
++    id = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
++    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
++    token = Column(String(200), unique=True, nullable=False)
++    platform = Column(String(20))
++    created_at = Column(DateTime, default=datetime.utcnow)
++    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
++
++
+ class StoreFollow(Base):
+     __tablename__ = "store_follows"
+     __table_args__ = (UniqueConstraint("user_id", "store_id", name="uq_store_follow_user_store"),)
+diff -ruN a/backend/app/notifications.py b/backend/app/notifications.py
+--- a/backend/app/notifications.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/notifications.py	2026-11-06 07:34:56.334078319 +0000
+@@ -0,0 +1,153 @@
++"""Order notifications: decides WHO is told, through WHICH channel, honouring each user's preferences.
++
++Channels
++  push  - push.notify_users (Expo), background thread
++  email - email_utils.send_email, background thread
++
++Preferences (models.NotificationPreference, all default to ON when a user has no row):
++  order_updates_email / order_updates_push : buyer, status changes (processing, dispatched, delivered, cancelled)
++  seller_orders_push                       : seller, new order / payment / buyer cancellation
++
++Transactional emails that already existed (payment confirmation to buyer and seller, receipts) are NOT
++controlled by these settings and are untouched. Nothing here ever raises: a failed notification must not
++fail the order request that triggered it.
++"""
++
++import logging
++import threading
++from dataclasses import dataclass
++
++from . import models, push
++from .email_utils import SITE_URL, send_email
++
++logger = logging.getLogger("eravenda.notifications")
++
++
++@dataclass(frozen=True)
++class Prefs:
++    order_updates_email: bool = True
++    order_updates_push: bool = True
++    seller_orders_push: bool = True
++
++
++def get_prefs(db, user_id: str) -> Prefs:
++    row = db.query(models.NotificationPreference).filter(models.NotificationPreference.user_id == user_id).first()
++    if not row:
++        return Prefs()
++    return Prefs(row.order_updates_email, row.order_updates_push, row.seller_orders_push)
++
++
++# ---------- wording ----------
++
++_PUSH_TEXT = {
++    "paid": "Payment received. The seller will start preparing your order.",
++    "processing": "The seller is preparing your order.",
++    "shipped": "Your order has been dispatched.",
++    "delivered": "Your order was delivered. Tap to rate your items.",
++    "cancelled": "Your order was cancelled.",
++    "refunded": "Your order was refunded.",
++}
++
++_EMAIL_HEADLINE = {
++    "processing": ("is being prepared", "The seller has accepted your order and is getting it ready."),
++    "shipped": ("has been dispatched", "Your order is on its way."),
++    "delivered": ("was delivered", "Your order has been marked as delivered. We hope you love it! You can rate your items in the app."),
++    "cancelled": ("was cancelled", "Your order was cancelled. If you already paid online, contact support about your refund."),
++}
++
++# "paid" is covered by the existing payment-confirmation email, so it has a push but no status email.
++EMAIL_STATUSES = tuple(_EMAIL_HEADLINE)
++
++
++def _status(order) -> str:
++    return order.status.value if hasattr(order.status, "value") else str(order.status)
++
++
++def _email_body(first_name: str, order, status: str) -> tuple[str, str]:
++    verb, lead = _EMAIL_HEADLINE[status]
++    store = order.store.store_name if order.store else "the seller"
++    lines = [f"- {i.product_name} x{i.quantity} — GHS {float(i.line_total):.2f}" for i in order.items] or ["- Order items"]
++    extra = ""
++    if status == "shipped":
++        if order.shipping_carrier:
++            extra += f"Carrier: {order.shipping_carrier}\n"
++        if order.tracking_number:
++            extra += f"Tracking number: {order.tracking_number}\n"
++        if order.estimated_delivery:
++            extra += f"Estimated delivery: {order.estimated_delivery:%d %b %Y}\n"
++        if extra:
++            extra += "\n"
++    note = f"Note from the seller: {order.seller_note}\n\n" if getattr(order, "seller_note", None) else ""
++    body = (
++        f"Hi {first_name},\n\n"
++        f"Your order {order.order_number} from {store} {verb}.\n{lead}\n\n"
++        f"{chr(10).join(lines)}\n\n"
++        f"{extra}{note}"
++        f"Track your order any time:\n{SITE_URL}/orders.html\n\n"
++        "To stop these emails, open the EraVenda app and go to Account > Notifications.\n"
++    )
++    return f"Your EraVenda order {order.order_number} {verb}", body
++
++
++def _send_email_async(to: str, subject: str, body: str) -> None:
++    def run():
++        try:
++            send_email(to=to, subject=subject, body=body)
++        except Exception:
++            logger.exception("Order status email failed for %s", to)
++
++    threading.Thread(target=run, daemon=True).start()
++
++
++# ---------- events ----------
++
++def order_status_changed(db, order) -> None:
++    """A seller (or admin) changed the order status: tell the buyer by push and/or email."""
++    try:
++        status = _status(order)
++        prefs = get_prefs(db, order.buyer_id)
++        if prefs.order_updates_push and status in _PUSH_TEXT:
++            push.notify_users(db, [order.buyer_id], f"Order #{order.order_number}", _PUSH_TEXT[status],
++                              {"type": "order", "audience": "buyer", "order_id": order.id})
++        if prefs.order_updates_email and status in EMAIL_STATUSES:
++            buyer = db.query(models.User).filter(models.User.id == order.buyer_id).first()
++            if buyer and buyer.email:
++                first = (buyer.full_name or "").strip().split(" ")[0] or "there"
++                subject, body = _email_body(first, order, status)
++                _send_email_async(buyer.email, subject, body)
++    except Exception:
++        logger.exception("Could not notify buyer about order %s", getattr(order, "id", "?"))
++
++
++def payment_confirmed(db, order) -> None:
++    """Payment succeeded: push the buyer and the seller (their emails already exist in payments.py)."""
++    try:
++        if get_prefs(db, order.buyer_id).order_updates_push:
++            push.notify_users(db, [order.buyer_id], f"Order #{order.order_number}", _PUSH_TEXT["paid"],
++                              {"type": "order", "audience": "buyer", "order_id": order.id})
++        new_order_for_seller(db, order, paid=True)
++    except Exception:
++        logger.exception("Could not notify about payment for order %s", getattr(order, "id", "?"))
++
++
++def new_order_for_seller(db, order, paid: bool = False) -> None:
++    try:
++        owner_id = order.store.owner_id if order.store else None
++        if not owner_id or not get_prefs(db, owner_id).seller_orders_push:
++            return
++        kind = "wholesale order" if getattr(order, "order_type", "retail") == "wholesale" else "order"
++        title = f"Order #{order.order_number} paid" if paid else f"New {kind}"
++        body = "Payment confirmed. You can start processing it." if paid else f"Order #{order.order_number} is waiting for you."
++        push.notify_users(db, [owner_id], title, body, {"type": "order", "audience": "seller", "order_id": order.id})
++    except Exception:
++        logger.exception("Could not notify seller about order %s", getattr(order, "id", "?"))
++
++
++def buyer_cancelled(db, order) -> None:
++    try:
++        owner_id = order.store.owner_id if order.store else None
++        if owner_id and get_prefs(db, owner_id).seller_orders_push:
++            push.notify_users(db, [owner_id], f"Order #{order.order_number} cancelled", "The buyer cancelled this order.",
++                              {"type": "order", "audience": "seller", "order_id": order.id})
++    except Exception:
++        logger.exception("Could not notify seller about cancellation of %s", getattr(order, "id", "?"))
+diff -ruN a/backend/app/push.py b/backend/app/push.py
+--- a/backend/app/push.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/push.py	2026-11-06 07:34:56.333154270 +0000
+@@ -0,0 +1,94 @@
++"""Push notifications through Expo's push service (best-effort).
++
++A failed or slow push must never break the request that triggered it, so:
++  * tokens are looked up inside the request (one fast query),
++  * the HTTP call to Expo happens on a short-lived background thread,
++  * every public function swallows and logs its own errors.
++Set PUSH_NOTIFICATIONS_ENABLED=false to switch it off, and (optionally) EXPO_ACCESS_TOKEN
++if you turned on "enhanced push security" in your Expo account.
++"""
++
++import logging
++import os
++import re
++import threading
++from typing import Iterable, Optional
++
++import httpx  # type: ignore[reportMissingImports]
++
++from . import models
++
++logger = logging.getLogger("eravenda.push")
++
++EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
++_TOKEN_RE = re.compile(r"^(Exponent|Expo)PushToken\[[^\]\s]+\]$")
++_CHUNK = 100  # Expo accepts up to 100 messages per request
++
++
++def enabled() -> bool:
++    return os.getenv("PUSH_NOTIFICATIONS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
++
++
++def is_valid_token(token: Optional[str]) -> bool:
++    return bool(token and len(token) <= 200 and _TOKEN_RE.match(token))
++
++
++def _headers() -> dict:
++    headers = {"Accept": "application/json", "Content-Type": "application/json"}
++    access = os.getenv("EXPO_ACCESS_TOKEN", "").strip()
++    if access:
++        headers["Authorization"] = f"Bearer {access}"
++    return headers
++
++
++def _prune(tokens: list[str]) -> None:
++    """Forget tokens Expo says no longer exist (app uninstalled, token rotated)."""
++    from .database import SessionLocal
++
++    db = SessionLocal()
++    try:
++        db.query(models.DeviceToken).filter(models.DeviceToken.token.in_(tokens)).delete(synchronize_session=False)
++        db.commit()
++    except Exception:
++        db.rollback()
++        logger.exception("Could not prune dead push tokens")
++    finally:
++        db.close()
++
++
++def _send(messages: list[dict]) -> None:
++    dead: list[str] = []
++    try:
++        with httpx.Client(timeout=10.0) as client:
++            for start in range(0, len(messages), _CHUNK):
++                chunk = messages[start:start + _CHUNK]
++                res = client.post(EXPO_PUSH_URL, json=chunk, headers=_headers())
++                res.raise_for_status()
++                tickets = res.json().get("data", [])
++                for message, ticket in zip(chunk, tickets):
++                    if ticket.get("status") == "error" and (ticket.get("details") or {}).get("error") == "DeviceNotRegistered":
++                        dead.append(message["to"])
++    except Exception:
++        logger.exception("Expo push request failed")
++    if dead:
++        _prune(dead)
++
++
++def notify_users(db, user_ids: Iterable[str], title: str, body: str, data: Optional[dict] = None) -> None:
++    """Queue a notification for every device registered to these users. Never raises."""
++    try:
++        if not enabled():
++            return
++        ids = [uid for uid in set(user_ids) if uid]
++        if not ids:
++            return
++        tokens = [row[0] for row in db.query(models.DeviceToken.token).filter(models.DeviceToken.user_id.in_(ids)).all()]
++        if not tokens:
++            return
++        messages = [
++            {"to": token, "title": title, "body": body, "data": data or {}, "sound": "default", "channelId": "orders"}
++            for token in tokens
++        ]
++        threading.Thread(target=_send, args=(messages,), daemon=True).start()
++    except Exception:
++        logger.exception("Could not queue push notification")
+diff -ruN a/backend/app/routers/account_deletion.py b/backend/app/routers/account_deletion.py
+--- a/backend/app/routers/account_deletion.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/routers/account_deletion.py	2026-11-06 07:34:56.332861336 +0000
+@@ -0,0 +1,70 @@
++"""In-app account deletion (required by Apple App Store and Google Play for apps with account creation).
++
++Flow used by the mobile app:
++  GET  /api/users/me/deletion-check   -> can the account be deleted now, and if not, why
++  POST /api/users/me/delete           -> {"confirm": "DELETE", "password": "..."}  (password only if the account has one)
++The rules for what is removed, anonymised and kept live in app/account_deletion.py.
++"""
++
++import logging
++
++from fastapi import APIRouter, Depends, HTTPException, Request  # type: ignore[reportMissingImports]
++from pydantic import BaseModel, Field  # type: ignore[reportMissingImports]
++from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
++
++from .. import account_deletion, auth, models, security
++from ..database import get_db
++
++logger = logging.getLogger("eravenda.account_deletion")
++router = APIRouter(prefix="/users/me", tags=["account"])
++
++
++class DeletionCheck(BaseModel):
++    can_delete: bool
++    blockers: list[str]
++    requires_password: bool
++
++
++class DeleteRequest(BaseModel):
++    confirm: str = Field(max_length=20)
++    password: str | None = Field(default=None, max_length=200)
++
++
++@router.get("/deletion-check", response_model=DeletionCheck)
++def deletion_check(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    blockers = account_deletion.deletion_blockers(db, current_user)
++    return DeletionCheck(can_delete=not blockers, blockers=blockers, requires_password=bool(current_user.password_hash))
++
++
++@router.post("/delete", status_code=204)
++def delete_account(
++    payload: DeleteRequest,
++    request: Request,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    security.enforce_rate_limit(request, "delete-account", 5, 3600, key=current_user.id)
++
++    if payload.confirm.strip().upper() != "DELETE":
++        raise HTTPException(status_code=400, detail='Type DELETE to confirm')
++    # 400, not 401: a 401 makes the mobile app treat the session as expired and sign the user out.
++    if current_user.password_hash and not auth.verify_password(payload.password or "", current_user.password_hash):
++        raise HTTPException(status_code=400, detail="That password is not correct")
++
++    blockers = account_deletion.deletion_blockers(db, current_user)
++    if blockers:
++        raise HTTPException(status_code=409, detail=" ".join(blockers))
++
++    original_email = current_user.email
++    first_name = (current_user.full_name or "").strip().split(" ")[0]
++    user_id = current_user.id
++    try:
++        account_deletion.anonymize_account(db, current_user)
++        db.commit()
++    except Exception:
++        db.rollback()
++        logger.exception("Account deletion failed for user %s", user_id)
++        raise HTTPException(status_code=500, detail="We couldn't delete your account. Nothing was changed. Please try again or contact support.")
++
++    logger.info("Account %s deleted by its owner", user_id)  # id only: no personal data in logs
++    account_deletion.send_goodbye_email(original_email, first_name)
+diff -ruN a/backend/app/routers/devices.py b/backend/app/routers/devices.py
+--- a/backend/app/routers/devices.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/routers/devices.py	2026-11-06 07:34:56.332119822 +0000
+@@ -0,0 +1,50 @@
++"""Device registration for push notifications (Expo push tokens)."""
++
++from fastapi import APIRouter, Depends, HTTPException, Request  # type: ignore[reportMissingImports]
++from pydantic import BaseModel, Field  # type: ignore[reportMissingImports]
++from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
++
++from .. import auth, models, push, security
++from ..database import get_db
++
++router = APIRouter(prefix="/devices", tags=["devices"])
++
++
++class DeviceIn(BaseModel):
++    token: str = Field(min_length=10, max_length=200)
++    platform: str | None = Field(default=None, max_length=20)
++
++
++@router.post("", status_code=204)
++def register_device(
++    payload: DeviceIn,
++    request: Request,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """Idempotent. A token always belongs to the most recent account that registered it, so someone who
++    signs in on a shared phone receives their own notifications, not the previous user's."""
++    security.enforce_rate_limit(request, "register-device", 30, 3600, key=current_user.id)
++    token = payload.token.strip()
++    if not push.is_valid_token(token):
++        raise HTTPException(status_code=400, detail="That is not a valid push token")
++    row = db.query(models.DeviceToken).filter(models.DeviceToken.token == token).first()
++    if row:
++        row.user_id = current_user.id
++        row.platform = payload.platform
++    else:
++        db.add(models.DeviceToken(user_id=current_user.id, token=token, platform=payload.platform))
++    db.commit()
++
++
++@router.post("/unregister", status_code=204)
++def unregister_device(
++    payload: DeviceIn,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """Called on sign-out so a shared phone stops receiving the previous user's notifications."""
++    db.query(models.DeviceToken).filter(
++        models.DeviceToken.token == payload.token.strip(), models.DeviceToken.user_id == current_user.id
++    ).delete(synchronize_session=False)
++    db.commit()
+diff -ruN a/backend/app/routers/moderation.py b/backend/app/routers/moderation.py
+--- a/backend/app/routers/moderation.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/routers/moderation.py	2026-11-06 07:34:56.332871196 +0000
+@@ -0,0 +1,270 @@
++"""Reporting and blocking for user-generated content (App Store guideline 1.2 / Google Play UGC policy).
++
++Buyers
++  POST   /api/reports                    report a product, store or review
++  GET    /api/blocks/stores              stores this user has hidden
++  POST   /api/blocks/stores/{store_id}   hide a store
++  DELETE /api/blocks/stores/{store_id}   unhide it
++Admins (web page: /admin/reports.html)
++  GET /api/admin/reports?status=open     the queue
++  PUT /api/admin/reports/{id}            resolve it, optionally acting on the content
++
++Content is already pre-moderated (stores and products wait for admin approval); this adds the after-the-fact path.
++An email goes to ADMIN_NOTIFICATION_EMAIL for every new report so none sits unseen.
++"""
++
++import logging
++import threading
++from datetime import datetime
++from typing import Literal, Optional
++
++from fastapi import APIRouter, Depends, HTTPException, Query, Request  # type: ignore[reportMissingImports]
++from pydantic import BaseModel, Field  # type: ignore[reportMissingImports]
++from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
++
++from .. import auth, models, security
++from ..database import get_db
++from ..email_utils import ADMIN_NOTIFICATION_EMAIL, SITE_URL, send_email
++
++logger = logging.getLogger("eravenda.moderation")
++router = APIRouter(tags=["moderation"])
++
++REASONS = ("spam", "counterfeit", "prohibited_item", "inappropriate", "scam", "other")
++REASON_LABEL = {
++    "spam": "Spam or misleading",
++    "counterfeit": "Counterfeit or fake",
++    "prohibited_item": "Illegal or prohibited item",
++    "inappropriate": "Offensive or inappropriate",
++    "scam": "Scam or fraud",
++    "other": "Something else",
++}
++STATUSES = ("open", "reviewing", "actioned", "dismissed")
++
++
++class ReportIn(BaseModel):
++    target_type: Literal["product", "store", "review"]
++    target_id: str = Field(min_length=1, max_length=40)
++    reason: Literal["spam", "counterfeit", "prohibited_item", "inappropriate", "scam", "other"]
++    details: Optional[str] = Field(default=None, max_length=1000)
++
++
++class ReportOut(BaseModel):
++    id: str
++    status: str
++    already_reported: bool = False
++
++
++def _resolve_target(db: Session, target_type: str, target_id: str):
++    """Returns (store_id, owner_user_id, label) for a reportable target, or raises 404."""
++    if target_type == "product":
++        row = db.query(models.Product).filter(models.Product.id == target_id).first()
++        if not row:
++            raise HTTPException(status_code=404, detail="That listing no longer exists")
++        store = db.query(models.Store).filter(models.Store.id == row.store_id).first()
++        return row.store_id, (store.owner_id if store else None), f"Product: {row.name}"
++    if target_type == "store":
++        store = db.query(models.Store).filter(models.Store.id == target_id).first()
++        if not store:
++            raise HTTPException(status_code=404, detail="That store no longer exists")
++        return store.id, store.owner_id, f"Store: {store.store_name}"
++    review = db.query(models.Review).filter(models.Review.id == target_id).first()
++    if not review:
++        raise HTTPException(status_code=404, detail="That review no longer exists")
++    product = db.query(models.Product).filter(models.Product.id == review.product_id).first()
++    return (product.store_id if product else None), review.buyer_id, "Review"
++
++
++def _email_admin_async(subject: str, body: str) -> None:
++    def run():
++        try:
++            send_email(to=ADMIN_NOTIFICATION_EMAIL, subject=subject, body=body)
++        except Exception:
++            logger.exception("Could not email the moderation team")
++
++    threading.Thread(target=run, daemon=True).start()
++
++
++@router.post("/reports", response_model=ReportOut, status_code=201)
++def create_report(
++    payload: ReportIn,
++    request: Request,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    security.enforce_rate_limit(request, "report-content", 10, 3600, key=current_user.id)
++    store_id, owner_id, label = _resolve_target(db, payload.target_type, payload.target_id)
++    if owner_id and owner_id == current_user.id:
++        raise HTTPException(status_code=400, detail="You can't report your own content")
++
++    # Reporting the same thing twice should not flood the queue: hand back the earlier report.
++    existing = (
++        db.query(models.ContentReport)
++        .filter(
++            models.ContentReport.reporter_id == current_user.id,
++            models.ContentReport.target_type == payload.target_type,
++            models.ContentReport.target_id == payload.target_id,
++            models.ContentReport.status.in_(("open", "reviewing")),
++        )
++        .first()
++    )
++    if existing:
++        return ReportOut(id=existing.id, status=existing.status, already_reported=True)
++
++    report = models.ContentReport(
++        reporter_id=current_user.id,
++        target_type=payload.target_type,
++        target_id=payload.target_id,
++        store_id=store_id,
++        reason=payload.reason,
++        details=(payload.details or "").strip() or None,
++    )
++    db.add(report)
++    db.commit()
++    db.refresh(report)
++
++    _email_admin_async(
++        f"New content report: {REASON_LABEL[payload.reason]}",
++        f"{label}\nReason: {REASON_LABEL[payload.reason]}\n"
++        f"Details: {report.details or '(none given)'}\n\n"
++        f"Review it here: {SITE_URL}/admin/reports.html\n",
++    )
++    return ReportOut(id=report.id, status=report.status)
++
++
++# ---------------- blocking ----------------
++
++class BlockedStore(BaseModel):
++    store_id: str
++    store_name: str
++
++
++@router.get("/blocks/stores", response_model=list[BlockedStore])
++def list_blocked_stores(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    rows = (
++        db.query(models.Store.id, models.Store.store_name)
++        .join(models.StoreBlock, models.StoreBlock.store_id == models.Store.id)
++        .filter(models.StoreBlock.user_id == current_user.id)
++        .order_by(models.StoreBlock.created_at.desc())
++        .all()
++    )
++    return [BlockedStore(store_id=r[0], store_name=r[1]) for r in rows]
++
++
++@router.post("/blocks/stores/{store_id}", status_code=204)
++def block_store(store_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    store = db.query(models.Store).filter(models.Store.id == store_id).first()
++    if not store:
++        raise HTTPException(status_code=404, detail="Store not found")
++    if store.owner_id == current_user.id:
++        raise HTTPException(status_code=400, detail="You can't block your own store")
++    exists = db.query(models.StoreBlock).filter(models.StoreBlock.user_id == current_user.id, models.StoreBlock.store_id == store_id).first()
++    if not exists:
++        db.add(models.StoreBlock(user_id=current_user.id, store_id=store_id))
++        db.commit()
++
++
++@router.delete("/blocks/stores/{store_id}", status_code=204)
++def unblock_store(store_id: str, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    db.query(models.StoreBlock).filter(models.StoreBlock.user_id == current_user.id, models.StoreBlock.store_id == store_id).delete(synchronize_session=False)
++    db.commit()
++
++
++# ---------------- admin queue ----------------
++
++admin_router = APIRouter(prefix="/admin/reports", tags=["moderation"], dependencies=[Depends(auth.require_role(models.UserRole.admin))])
++
++
++class AdminReportOut(BaseModel):
++    id: str
++    status: str
++    target_type: str
++    target_id: str
++    target_label: str
++    store_id: Optional[str]
++    store_name: Optional[str]
++    reason: str
++    reason_label: str
++    details: Optional[str]
++    reporter_email: Optional[str]
++    admin_note: Optional[str]
++    created_at: datetime
++
++
++class AdminReportUpdate(BaseModel):
++    status: Literal["open", "reviewing", "actioned", "dismissed"]
++    admin_note: Optional[str] = Field(default=None, max_length=1000)
++    # What to do to the reported content. "none" only records the decision.
++    action: Literal["none", "hide_product", "suspend_store", "clear_review_comment"] = "none"
++
++
++def _label(db: Session, report: models.ContentReport) -> str:
++    try:
++        return _resolve_target(db, report.target_type, report.target_id)[2]
++    except HTTPException:
++        return f"{report.target_type.title()} (since removed)"
++
++
++def _admin_out(db: Session, r: models.ContentReport) -> AdminReportOut:
++    store = db.query(models.Store).filter(models.Store.id == r.store_id).first() if r.store_id else None
++    reporter = db.query(models.User).filter(models.User.id == r.reporter_id).first() if r.reporter_id else None
++    return AdminReportOut(
++        id=r.id, status=r.status, target_type=r.target_type, target_id=r.target_id, target_label=_label(db, r),
++        store_id=r.store_id, store_name=store.store_name if store else None,
++        reason=r.reason, reason_label=REASON_LABEL.get(r.reason, r.reason), details=r.details,
++        reporter_email=reporter.email if reporter else None, admin_note=r.admin_note, created_at=r.created_at,
++    )
++
++
++@admin_router.get("", response_model=list[AdminReportOut])
++def admin_list_reports(
++    status: str = Query("open", description="open | reviewing | actioned | dismissed | all"),
++    limit: int = Query(100, ge=1, le=200),
++    db: Session = Depends(get_db),
++):
++    query = db.query(models.ContentReport)
++    if status != "all":
++        if status not in STATUSES:
++            raise HTTPException(status_code=400, detail="Unknown status")
++        query = query.filter(models.ContentReport.status == status)
++    return [_admin_out(db, r) for r in query.order_by(models.ContentReport.created_at.desc()).limit(limit).all()]
++
++
++@admin_router.put("/{report_id}", response_model=AdminReportOut)
++def admin_resolve_report(
++    report_id: str,
++    payload: AdminReportUpdate,
++    db: Session = Depends(get_db),
++    admin: models.User = Depends(auth.get_current_user),
++):
++    report = db.query(models.ContentReport).filter(models.ContentReport.id == report_id).first()
++    if not report:
++        raise HTTPException(status_code=404, detail="Report not found")
++
++    if payload.action == "hide_product":
++        if report.target_type != "product":
++            raise HTTPException(status_code=400, detail="hide_product only applies to a product report")
++        product = db.query(models.Product).filter(models.Product.id == report.target_id).first()
++        if product:
++            product.status = models.ProductStatus.rejected
++            product.rejection_reason = f"Removed after a report: {REASON_LABEL.get(report.reason, report.reason)}"
++    elif payload.action == "suspend_store":
++        if not report.store_id:
++            raise HTTPException(status_code=400, detail="This report has no store to suspend")
++        store = db.query(models.Store).filter(models.Store.id == report.store_id).first()
++        if store:
++            store.status = models.StoreStatus.suspended
++            store.rejection_reason = f"Suspended after a report: {REASON_LABEL.get(report.reason, report.reason)}"
++    elif payload.action == "clear_review_comment":
++        if report.target_type != "review":
++            raise HTTPException(status_code=400, detail="clear_review_comment only applies to a review report")
++        review = db.query(models.Review).filter(models.Review.id == report.target_id).first()
++        if review:
++            review.comment = None
++
++    report.status = "actioned" if payload.action != "none" and payload.status == "open" else payload.status
++    report.admin_note = (payload.admin_note or "").strip() or None
++    report.reviewed_by = admin.id
++    report.reviewed_at = datetime.utcnow()
++    db.commit()
++    db.refresh(report)
++    return _admin_out(db, report)
+diff -ruN a/backend/app/routers/notification_preferences.py b/backend/app/routers/notification_preferences.py
+--- a/backend/app/routers/notification_preferences.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/app/routers/notification_preferences.py	2026-11-06 07:34:56.332835171 +0000
+@@ -0,0 +1,45 @@
++"""Per-user notification settings, shared by the mobile app's Notifications screen."""
++
++from fastapi import APIRouter, Depends  # type: ignore[reportMissingImports]
++from pydantic import BaseModel  # type: ignore[reportMissingImports]
++from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
++
++from .. import auth, models, notifications
++from ..database import get_db
++
++router = APIRouter(prefix="/users/me/notification-preferences", tags=["notifications"])
++
++
++class PreferencesOut(BaseModel):
++    order_updates_email: bool
++    order_updates_push: bool
++    seller_orders_push: bool
++
++
++class PreferencesUpdate(BaseModel):
++    """Every field is optional so the app can send just the switch that changed."""
++    order_updates_email: bool | None = None
++    order_updates_push: bool | None = None
++    seller_orders_push: bool | None = None
++
++
++def _out(p: notifications.Prefs) -> PreferencesOut:
++    return PreferencesOut(order_updates_email=p.order_updates_email, order_updates_push=p.order_updates_push, seller_orders_push=p.seller_orders_push)
++
++
++@router.get("", response_model=PreferencesOut)
++def read_preferences(db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    return _out(notifications.get_prefs(db, current_user.id))
++
++
++@router.put("", response_model=PreferencesOut)
++def update_preferences(payload: PreferencesUpdate, db: Session = Depends(get_db), current_user: models.User = Depends(auth.get_current_user)):
++    row = db.query(models.NotificationPreference).filter(models.NotificationPreference.user_id == current_user.id).first()
++    if not row:
++        row = models.NotificationPreference(user_id=current_user.id, order_updates_email=True, order_updates_push=True, seller_orders_push=True)
++        db.add(row)
++    for field, value in payload.model_dump(exclude_unset=True).items():
++        if value is not None:
++            setattr(row, field, value)
++    db.commit()
++    return _out(notifications.get_prefs(db, current_user.id))
+diff -ruN a/backend/app/routers/orders.py b/backend/app/routers/orders.py
+--- a/backend/app/routers/orders.py	2026-11-06 07:34:56.324644689 +0000
++++ b/backend/app/routers/orders.py	2026-11-06 07:34:56.332094577 +0000
+@@ -3,7 +3,7 @@
+ from fastapi import APIRouter, Depends, HTTPException, Request, Response  # type: ignore[reportMissingImports]
+ from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
+ 
+-from .. import models, schemas, auth, security, delivery_fees, wholesale, receipts
++from .. import models, schemas, auth, security, delivery_fees, wholesale, receipts, notifications
+ from ..database import get_db
+ from ..utils import generate_order_number
+ from ..product_pricing import product_commission_rate
+@@ -294,6 +294,9 @@
+     db.commit()
+     for order in created_orders:
+         db.refresh(order)
++        # Cash-on-delivery orders can be accepted right away; online ones notify the seller again once paid.
++        if order.payment_method == models.PaymentMethod.cash_on_delivery:
++            notifications.new_order_for_seller(db, order)
+ 
+     return created_orders
+ 
+@@ -377,6 +380,7 @@
+     order.status = models.OrderStatus.cancelled
+     db.commit()
+     db.refresh(order)
++    notifications.buyer_cancelled(db, order)
+     return order
+ 
+ 
+@@ -501,4 +505,5 @@
+         order.delivered_at = datetime.utcnow()
+     db.commit()
+     db.refresh(order)
++    notifications.order_status_changed(db, order)
+     return order
+diff -ruN a/backend/app/routers/payments.py b/backend/app/routers/payments.py
+--- a/backend/app/routers/payments.py	2026-11-06 07:34:56.324285825 +0000
++++ b/backend/app/routers/payments.py	2026-11-06 07:34:56.332846261 +0000
+@@ -8,7 +8,7 @@
+ from fastapi import APIRouter, Depends, HTTPException, Request  # type: ignore[reportMissingImports]
+ from sqlalchemy.orm import Session  # type: ignore[reportMissingImports]
+ 
+-from .. import models, schemas, auth, security, receipts
++from .. import models, schemas, auth, security, receipts, notifications
+ from ..database import get_db
+ from ..email_utils import ADMIN_NOTIFICATION_EMAIL, SUPPORT_EMAIL, send_email, SITE_URL
+ from ..service_pricing import service_commission_for
+@@ -65,6 +65,8 @@
+     online-payment status logic above (which would wrongly reopen an order
+     already marked delivered — see the guard in record_cod_payment)."""
+     buyer = db.query(models.User).filter(models.User.id == order.buyer_id).first()
++    # Push and status notifications honour each user's preferences and never raise (see notifications.py).
++    notifications.payment_confirmed(db, order)
+     # Built once, shared by all three emails below: the plain-text item list
+     # each already built for its own body, plus the same items as thumbnail
+     # rows for send_email's `items` (HTML-only — see its docstring).
+diff -ruN a/backend/app/routers/products.py b/backend/app/routers/products.py
+--- a/backend/app/routers/products.py	2026-11-06 07:34:56.323888032 +0000
++++ b/backend/app/routers/products.py	2026-11-06 07:34:56.331893113 +0000
+@@ -49,6 +49,7 @@
+     db: Session = Depends(get_db),
+     q: Optional[str] = Query(None, description="Search text"),
+     category_id: Optional[str] = None,
++    store_id: Optional[str] = Query(None, description="Only products sold by this store"),
+     min_price: Optional[float] = None,
+     max_price: Optional[float] = None,
+     brand: Optional[str] = None,
+@@ -68,6 +69,8 @@
+             row[0] for row in db.query(models.Category.id).filter(models.Category.parent_id == category_id).all()
+         ]
+         query = query.filter(models.Product.category_id.in_([category_id] + child_ids))
++    if store_id:
++        query = query.filter(models.Product.store_id == store_id)
+     if min_price is not None:
+         query = query.filter(models.Product.price >= min_price)
+     if max_price is not None:
+diff -ruN a/backend/app/social_auth.py b/backend/app/social_auth.py
+--- a/backend/app/social_auth.py	2026-11-06 07:34:56.321001583 +0000
++++ b/backend/app/social_auth.py	2026-11-06 07:34:56.329853567 +0000
+@@ -20,8 +20,20 @@
+ 
+ logger = logging.getLogger("eravenda.social_auth")
+ 
+-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+-APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID")  # Apple's "Services ID", e.g. com.eravenda.web
++
++
++def parse_client_ids(raw):
++    """A client-id setting may hold one id or several, comma separated (whitespace ignored)."""
++    return [part.strip() for part in (raw or "").split(",") if part.strip()]
++
++
++# Google: the WEB client id. The mobile app signs in with the same web client id as its "server" client, so
++# its tokens carry this audience too. Extra comma-separated ids are accepted if you ever need them.
++GOOGLE_CLIENT_ID = parse_client_ids(os.getenv("GOOGLE_CLIENT_ID"))
++# Apple: the website's "Services ID" (e.g. com.eravenda.web) AND the iOS app's bundle id (e.g. com.eravenda.app),
++# because Apple puts whichever one signed the user in into the token. Comma separated, for example:
++#   APPLE_CLIENT_ID=com.eravenda.web,com.eravenda.app
++APPLE_CLIENT_ID = parse_client_ids(os.getenv("APPLE_CLIENT_ID"))
+ 
+ GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+ GOOGLE_ISSUERS = {"accounts.google.com", "https://accounts.google.com"}
+@@ -53,7 +65,7 @@
+     return keys
+ 
+ 
+-def _verify(token: str, jwks_url: str, valid_issuers: set, audience: str, provider: str) -> dict:
++def _verify(token: str, jwks_url: str, valid_issuers: set, audience: list, provider: str) -> dict:
+     if not audience:
+         raise TokenVerificationError(
+             f"{provider.upper()}_CLIENT_ID is not configured on the server. "
+diff -ruN a/backend/tests/test_account_deletion.py b/backend/tests/test_account_deletion.py
+--- a/backend/tests/test_account_deletion.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/tests/test_account_deletion.py	2026-11-06 07:34:56.336338598 +0000
+@@ -0,0 +1,157 @@
++"""End-to-end checks for in-app account deletion (anonymisation).
++
++Runs against a real PostgreSQL, like tests/test_wholesale.py (set DATABASE_URL to a throwaway database):
++
++    DATABASE_URL=postgresql://localhost:5432/eravenda_test SECRET_KEY=test \
++        python -m pytest tests/test_account_deletion.py -q
++
++NOTE: written against the real routes and models but not yet executed (the authoring sandbox had no PostgreSQL).
++Run it once before shipping and fix any fixture detail that differs on your database.
++"""
++import os
++import uuid
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import text
++
++os.environ.setdefault("SECRET_KEY", "test-secret-key-for-account-deletion-tests")
++
++from app.database import engine  # noqa: E402
++from app.main import app  # noqa: E402
++
++PWD = "Passw0rd!123"
++
++
++def _sql(query, **params):
++    with engine.begin() as conn:
++        return conn.execute(text(query), params)
++
++
++@pytest.fixture(scope="module")
++def client():
++    with TestClient(app, base_url="http://testserver/api") as c:
++        yield c
++
++
++def _register(client, name):
++    email = f"{name}-{uuid.uuid4().hex[:6]}@example.com"
++    r = client.post("/auth/register", json={"full_name": name, "email": email, "password": PWD})
++    assert r.status_code in (200, 201), r.text
++    return {"Authorization": f"Bearer {r.json()['access_token']}"}, r.json()["user"]["id"], email
++
++
++def _relogin(client, email, role, user_id):
++    _sql("UPDATE users SET role = :r WHERE id = :i", r=role, i=user_id)
++    r = client.post("/auth/login", data={"username": email, "password": PWD})
++    assert r.status_code == 200, r.text
++    return {"Authorization": f"Bearer {r.json()['access_token']}"}
++
++
++@pytest.fixture(scope="module")
++def shop(client):
++    """An admin-made category plus one approved seller with one approved product."""
++    admin_h, admin_id, admin_email = _register(client, "Admin")
++    admin_h = _relogin(client, admin_email, "admin", admin_id)
++    cat = client.post("/categories", headers=admin_h, json={"name": f"Cat {uuid.uuid4().hex[:4]}"})
++    assert cat.status_code == 201, cat.text
++
++    h, uid, email = _register(client, "Seller")
++    r = client.post("/stores", headers=h, json={"store_name": f"Shop {uuid.uuid4().hex[:4]}", "region": "Bono", "city": "Sunyani"})
++    assert r.status_code == 201, r.text
++    _sql("UPDATE stores SET status = 'approved' WHERE id = :i", i=r.json()["id"])
++    h = _relogin(client, email, "seller", uid)
++    p = client.post("/products", headers=h, json={"name": "Test shoe", "category_id": cat.json()["id"], "price": 50, "stock_quantity": 100})
++    assert p.status_code == 201, p.text
++    _sql("UPDATE products SET status = 'approved' WHERE id = :i", i=p.json()["id"])
++    return {"cat": cat.json()["id"], "product_id": p.json()["id"]}
++
++
++def _address(client, h):
++    r = client.post("/auth/addresses", headers=h, json={"recipient_name": "Ama Mensah", "phone": "0240000000", "region": "Bono", "city": "Sunyani", "landmark": "Blue gate"})
++    assert r.status_code in (200, 201), r.text
++    return r.json()["id"]
++
++
++def test_check_for_a_new_buyer(client):
++    h, _, _ = _register(client, "Fresh")
++    r = client.get("/users/me/deletion-check", headers=h)
++    assert r.status_code == 200
++    assert r.json() == {"can_delete": True, "blockers": [], "requires_password": True}
++
++
++def test_confirmation_word_and_password_are_required(client):
++    h, _, _ = _register(client, "Careful")
++    assert client.post("/users/me/delete", headers=h, json={"confirm": "nope", "password": PWD}).status_code == 400
++    wrong = client.post("/users/me/delete", headers=h, json={"confirm": "DELETE", "password": "not-the-password"})
++    assert wrong.status_code == 400  # not 401, which would sign the app user out
++    assert client.get("/auth/me", headers=h).status_code == 200  # still alive
++
++
++def test_open_order_blocks_deletion_until_it_is_cancelled(client, shop):
++    h, _, _ = _register(client, "Shopper")
++    addr = _address(client, h)
++    client.post("/cart/items", headers=h, json={"product_id": shop["product_id"], "quantity": 1})
++    order = client.post("/orders/checkout", headers=h, json={"address_id": addr, "is_pickup": True})
++    assert order.status_code in (200, 201), order.text
++    order_id = order.json()[0]["id"]
++
++    check = client.get("/users/me/deletion-check", headers=h).json()
++    assert check["can_delete"] is False and "in progress" in check["blockers"][0]
++    assert client.post("/users/me/delete", headers=h, json={"confirm": "DELETE", "password": PWD}).status_code == 409
++
++    assert client.post(f"/orders/{order_id}/cancel", headers=h).status_code == 200
++    assert client.get("/users/me/deletion-check", headers=h).json()["can_delete"] is True
++
++
++def test_deletion_anonymises_the_account_and_keeps_order_records(client, shop):
++    h, uid, email = _register(client, "Leaver")
++    used = _address(client, h)
++    unused = _address(client, h)
++    client.post("/cart/items", headers=h, json={"product_id": shop["product_id"], "quantity": 1})
++    order = client.post("/orders/checkout", headers=h, json={"address_id": used, "is_pickup": True}).json()[0]
++    assert client.post(f"/orders/{order['id']}/cancel", headers=h).status_code == 200  # finished orders do not block
++    client.post("/devices", headers=h, json={"token": "ExponentPushToken[abc123]", "platform": "ios"})
++    client.put("/users/me/notification-preferences", headers=h, json={"order_updates_email": False})
++    client.post(f"/wishlist/{shop['product_id']}", headers=h)
++
++    assert client.post("/users/me/delete", headers=h, json={"confirm": "delete", "password": PWD}).status_code == 204
++
++    user = _sql("SELECT full_name, email, phone, password_hash, is_active, is_verified FROM users WHERE id = :i", i=uid).one()
++    assert user.full_name == "Deleted user" and user.email.startswith("deleted-") and user.email != email
++    assert user.phone is None and user.password_hash is None and user.is_active is False and user.is_verified is False
++
++    # records the business must keep are still there, but identify nobody
++    assert _sql("SELECT count(*) FROM orders WHERE id = :i AND buyer_id = :u", i=order["id"], u=uid).scalar() == 1
++    kept = _sql("SELECT recipient_name, phone, landmark FROM addresses WHERE id = :i", i=used).one()
++    assert kept.recipient_name == "Deleted user" and kept.landmark is None
++    # everything else personal is gone
++    assert _sql("SELECT count(*) FROM addresses WHERE id = :i", i=unused).scalar() == 0
++    assert _sql("SELECT count(*) FROM device_tokens WHERE user_id = :u", u=uid).scalar() == 0
++    assert _sql("SELECT count(*) FROM notification_preferences WHERE user_id = :u", u=uid).scalar() == 0
++    assert _sql("SELECT count(*) FROM wishlists WHERE user_id = :u", u=uid).scalar() == 0
++
++    # the account can no longer be used
++    assert client.post("/auth/login", data={"username": email, "password": PWD}).status_code in (400, 401, 403)
++    assert client.get("/auth/me", headers=h).status_code in (401, 403)
++
++
++def test_seller_deletion_closes_the_store_and_hides_products(client, shop):
++    h, uid, email = _register(client, "Closer")
++    r = client.post("/stores", headers=h, json={"store_name": f"Closing {uuid.uuid4().hex[:4]}", "description": "private text", "region": "Bono", "city": "Sunyani"})
++    assert r.status_code == 201, r.text
++    store_id = r.json()["id"]
++    _sql("UPDATE stores SET status = 'approved' WHERE id = :i", i=store_id)
++    h = _relogin(client, email, "seller", uid)
++    p = client.post("/products", headers=h, json={"name": "Closing item", "category_id": shop["cat"], "price": 10, "stock_quantity": 5})
++    assert p.status_code == 201, p.text
++    _sql("UPDATE products SET status = 'approved' WHERE id = :i", i=p.json()["id"])
++
++    assert client.post("/users/me/delete", headers=h, json={"confirm": "DELETE", "password": PWD}).status_code == 204
++
++    store = _sql("SELECT store_name, description, status FROM stores WHERE id = :i", i=store_id).one()
++    assert store.store_name == "Closed store" and store.description is None and str(store.status).endswith("suspended")
++    product = _sql("SELECT status, stock_quantity FROM products WHERE id = :i", i=p.json()["id"]).one()
++    assert str(product.status).endswith("out_of_stock") and product.stock_quantity == 0
++    public = client.get("/products", params={"q": "Closing item"}).json()
++    assert all(item["id"] != p.json()["id"] for item in public["items"])
+diff -ruN a/backend/tests/test_moderation.py b/backend/tests/test_moderation.py
+--- a/backend/tests/test_moderation.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/tests/test_moderation.py	2026-11-06 07:34:56.336423876 +0000
+@@ -0,0 +1,132 @@
++"""End-to-end checks for reporting and blocking (routers/moderation.py).
++
++Runs against a real PostgreSQL, like tests/test_wholesale.py:
++
++    DATABASE_URL=postgresql://localhost:5432/eravenda_test SECRET_KEY=test \
++        python -m pytest tests/test_moderation.py -q
++
++NOTE: written against the real routes and models but not yet executed (the authoring sandbox had no PostgreSQL).
++"""
++import os
++import uuid
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import text
++
++os.environ.setdefault("SECRET_KEY", "test-secret-key-for-moderation-tests-0123456789")
++
++from app.database import engine  # noqa: E402
++from app.main import app  # noqa: E402
++
++PWD = "Passw0rd!123"
++
++
++def _sql(query, **params):
++    with engine.begin() as conn:
++        return conn.execute(text(query), params)
++
++
++@pytest.fixture(scope="module")
++def client():
++    with TestClient(app, base_url="http://testserver/api") as c:
++        yield c
++
++
++def _register(client, name):
++    email = f"{name}-{uuid.uuid4().hex[:6]}@example.com"
++    r = client.post("/auth/register", json={"full_name": name, "email": email, "password": PWD})
++    assert r.status_code in (200, 201), r.text
++    return {"Authorization": f"Bearer {r.json()['access_token']}"}, r.json()["user"]["id"], email
++
++
++def _relogin(client, email, role, user_id):
++    _sql("UPDATE users SET role = :r WHERE id = :i", r=role, i=user_id)
++    r = client.post("/auth/login", data={"username": email, "password": PWD})
++    assert r.status_code == 200, r.text
++    return {"Authorization": f"Bearer {r.json()['access_token']}"}
++
++
++@pytest.fixture(scope="module")
++def world(client):
++    admin_h, admin_id, admin_email = _register(client, "Admin")
++    admin_h = _relogin(client, admin_email, "admin", admin_id)
++    cat = client.post("/categories", headers=admin_h, json={"name": f"Cat {uuid.uuid4().hex[:4]}"})
++    assert cat.status_code == 201, cat.text
++
++    sh, suid, semail = _register(client, "Seller")
++    r = client.post("/stores", headers=sh, json={"store_name": f"Shop {uuid.uuid4().hex[:4]}", "region": "Bono", "city": "Sunyani"})
++    assert r.status_code == 201, r.text
++    store_id = r.json()["id"]
++    _sql("UPDATE stores SET status = 'approved' WHERE id = :i", i=store_id)
++    sh = _relogin(client, semail, "seller", suid)
++    p = client.post("/products", headers=sh, json={"name": f"Reported {uuid.uuid4().hex[:4]}", "category_id": cat.json()["id"], "price": 20, "stock_quantity": 5})
++    assert p.status_code == 201, p.text
++    _sql("UPDATE products SET status = 'approved' WHERE id = :i", i=p.json()["id"])
++    buyer_h, _, _ = _register(client, "Buyer")
++    return {"admin": admin_h, "seller": sh, "store_id": store_id, "product": p.json(), "buyer": buyer_h}
++
++
++def _report(client, h, **body):
++    return client.post("/reports", headers=h, json=body)
++
++
++def test_guests_cannot_report(client, world):
++    r = client.post("/reports", json={"target_type": "product", "target_id": world["product"]["id"], "reason": "spam"})
++    assert r.status_code in (401, 403)
++
++
++def test_report_validation(client, world):
++    b = world["buyer"]
++    assert _report(client, b, target_type="product", target_id=world["product"]["id"], reason="not-a-reason").status_code == 422
++    assert _report(client, b, target_type="product", target_id=str(uuid.uuid4()), reason="spam").status_code == 404
++    assert _report(client, world["seller"], target_type="product", target_id=world["product"]["id"], reason="spam").status_code == 400  # own listing
++    assert _report(client, world["seller"], target_type="store", target_id=world["store_id"], reason="spam").status_code == 400
++
++
++def test_report_is_created_once_per_target(client, world):
++    first = _report(client, world["buyer"], target_type="product", target_id=world["product"]["id"], reason="counterfeit", details="Looks fake")
++    assert first.status_code == 201 and first.json()["status"] == "open" and first.json()["already_reported"] is False
++    again = _report(client, world["buyer"], target_type="product", target_id=world["product"]["id"], reason="spam")
++    assert again.status_code == 201 and again.json()["already_reported"] is True and again.json()["id"] == first.json()["id"]
++
++
++def test_blocking_a_store_round_trip(client, world):
++    b, sid = world["buyer"], world["store_id"]
++    assert client.post(f"/blocks/stores/{sid}", headers=b).status_code == 204
++    assert client.post(f"/blocks/stores/{sid}", headers=b).status_code == 204  # idempotent
++    assert [x["store_id"] for x in client.get("/blocks/stores", headers=b).json()] == [sid]
++    assert client.post(f"/blocks/stores/{sid}", headers=world["seller"]).status_code == 400  # not your own store
++    assert client.delete(f"/blocks/stores/{sid}", headers=b).status_code == 204
++    assert client.get("/blocks/stores", headers=b).json() == []
++    assert client.post(f"/blocks/stores/{uuid.uuid4()}", headers=b).status_code == 404
++
++
++def test_admin_queue_is_admin_only(client, world):
++    assert client.get("/admin/reports", headers=world["buyer"]).status_code == 403
++    assert client.get("/admin/reports", headers=world["seller"]).status_code == 403
++    assert client.get("/admin/reports").status_code in (401, 403)
++
++
++def test_admin_can_hide_the_reported_product(client, world):
++    queue = client.get("/admin/reports", headers=world["admin"], params={"status": "open"}).json()
++    mine = [r for r in queue if r["target_id"] == world["product"]["id"]]
++    assert mine and mine[0]["reason"] == "counterfeit" and mine[0]["reporter_email"]
++
++    wrong = client.put(f"/admin/reports/{mine[0]['id']}", headers=world["admin"], json={"status": "open", "action": "clear_review_comment"})
++    assert wrong.status_code == 400  # action must match the target type
++
++    done = client.put(f"/admin/reports/{mine[0]['id']}", headers=world["admin"], json={"status": "open", "action": "hide_product", "admin_note": "Removed"})
++    assert done.status_code == 200 and done.json()["status"] == "actioned" and done.json()["admin_note"] == "Removed"
++    assert str(_sql("SELECT status FROM products WHERE id = :i", i=world["product"]["id"]).scalar()).endswith("rejected")
++    public = client.get("/products", params={"q": world["product"]["name"]}).json()
++    assert all(item["id"] != world["product"]["id"] for item in public["items"])
++    assert not [r for r in client.get("/admin/reports", headers=world["admin"]).json() if r["id"] == mine[0]["id"]]  # no longer "open"
++
++
++def test_store_report_can_suspend_the_store(client, world):
++    rep = _report(client, world["buyer"], target_type="store", target_id=world["store_id"], reason="scam")
++    assert rep.status_code == 201
++    r = client.put(f"/admin/reports/{rep.json()['id']}", headers=world["admin"], json={"status": "open", "action": "suspend_store"})
++    assert r.status_code == 200 and r.json()["status"] == "actioned"
++    assert str(_sql("SELECT status FROM stores WHERE id = :i", i=world["store_id"]).scalar()).endswith("suspended")
+diff -ruN a/backend/tests/test_notifications.py b/backend/tests/test_notifications.py
+--- a/backend/tests/test_notifications.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/tests/test_notifications.py	2026-11-06 07:34:56.335463476 +0000
+@@ -0,0 +1,86 @@
++"""Unit tests for notifications.py (who gets told, through which channel). No database or network.
++
++    SECRET_KEY=a-long-random-test-secret-of-32-chars-or-more python -m pytest tests/test_notifications.py -q
++"""
++import os
++from datetime import datetime
++from types import SimpleNamespace as NS
++
++os.environ.setdefault("SECRET_KEY", "test-secret-key-for-notification-tests-0123456789")
++
++from app import notifications  # noqa: E402
++
++
++def _order(status="shipped", **kw):
++    base = dict(
++        id="o1", order_number="ORD-1", buyer_id="buyer", status=NS(value=status), order_type="retail",
++        store=NS(store_name="Kofi Shop", owner_id="seller"),
++        items=[NS(product_name="Shoes", quantity=2, line_total=100)],
++        shipping_carrier="Bolt", tracking_number="T123", estimated_delivery=datetime(2026, 12, 1), seller_note=None,
++    )
++    base.update(kw)
++    return NS(**base)
++
++
++class _Db:
++    """Only the buyer lookup in order_status_changed uses the db; preferences are monkeypatched."""
++    def query(self, *_a, **_k):
++        return self
++
++    def filter(self, *_a, **_k):
++        return self
++
++    def first(self):
++        return NS(email="ama@example.com", full_name="Ama Mensah")
++
++
++def _spy(monkeypatch, prefs):
++    pushes, emails = [], []
++    monkeypatch.setattr(notifications, "get_prefs", lambda _db, _uid: prefs)
++    monkeypatch.setattr(notifications.push, "notify_users", lambda _db, ids, title, body, data=None: pushes.append((list(ids), title, body, data)))
++    monkeypatch.setattr(notifications, "_send_email_async", lambda to, subject, body: emails.append((to, subject, body)))
++    return pushes, emails
++
++
++def test_shipped_sends_push_and_email_with_tracking(monkeypatch):
++    pushes, emails = _spy(monkeypatch, notifications.Prefs())
++    notifications.order_status_changed(_Db(), _order("shipped"))
++    assert pushes and pushes[0][0] == ["buyer"] and pushes[0][3]["order_id"] == "o1"
++    to, subject, body = emails[0]
++    assert to == "ama@example.com" and "dispatched" in subject
++    assert "Hi Ama," in body and "Tracking number: T123" in body and "Carrier: Bolt" in body
++    assert "Account > Notifications" in body
++
++
++def test_email_off_still_pushes(monkeypatch):
++    pushes, emails = _spy(monkeypatch, notifications.Prefs(order_updates_email=False))
++    notifications.order_status_changed(_Db(), _order("delivered"))
++    assert pushes and not emails
++
++
++def test_push_off_still_emails(monkeypatch):
++    pushes, emails = _spy(monkeypatch, notifications.Prefs(order_updates_push=False))
++    notifications.order_status_changed(_Db(), _order("processing"))
++    assert emails and not pushes
++
++
++def test_paid_status_pushes_but_has_no_status_email(monkeypatch):
++    pushes, emails = _spy(monkeypatch, notifications.Prefs())
++    notifications.order_status_changed(_Db(), _order("paid"))
++    assert pushes and not emails  # the existing payment-confirmation email covers "paid"
++
++
++def test_seller_pushes_respect_their_switch(monkeypatch):
++    pushes, _ = _spy(monkeypatch, notifications.Prefs(seller_orders_push=False))
++    notifications.new_order_for_seller(_Db(), _order("pending"))
++    notifications.buyer_cancelled(_Db(), _order("cancelled"))
++    assert not pushes
++    pushes, _ = _spy(monkeypatch, notifications.Prefs())
++    notifications.new_order_for_seller(_Db(), _order("pending", order_type="wholesale"))
++    assert pushes[0][0] == ["seller"] and "wholesale" in pushes[0][1]
++
++
++def test_payment_confirmed_notifies_both_sides(monkeypatch):
++    pushes, _ = _spy(monkeypatch, notifications.Prefs())
++    notifications.payment_confirmed(_Db(), _order("paid"))
++    assert sorted(p[0][0] for p in pushes) == ["buyer", "seller"]
+diff -ruN a/backend/tests/test_push.py b/backend/tests/test_push.py
+--- a/backend/tests/test_push.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/tests/test_push.py	2026-11-06 07:34:56.335952728 +0000
+@@ -0,0 +1,60 @@
++"""Unit tests for push.py that need no database or network.
++
++    SECRET_KEY=a-long-random-test-secret-of-32-chars-or-more python -m pytest tests/test_push.py -q
++"""
++import os
++
++os.environ.setdefault("SECRET_KEY", "test-secret-key-for-push-tests-0123456789abcdef")
++
++from app import push  # noqa: E402
++
++
++class _FakeQuery:
++    def __init__(self, rows):
++        self.rows = rows
++
++    def filter(self, *_a, **_k):
++        return self
++
++    def all(self):
++        return self.rows
++
++
++class _FakeDb:
++    def __init__(self, tokens):
++        self.tokens = tokens
++
++    def query(self, *_a, **_k):
++        return _FakeQuery([(t,) for t in self.tokens])
++
++
++def test_token_validation():
++    assert push.is_valid_token("ExponentPushToken[abc123_-XYZ]")
++    assert push.is_valid_token("ExpoPushToken[abc123]")
++    assert not push.is_valid_token("not-a-token")
++    assert not push.is_valid_token("")
++    assert not push.is_valid_token(None)
++
++
++def test_notify_sends_one_message_per_device(monkeypatch):
++    sent = []
++
++    class _Immediate:
++        def __init__(self, target, args, daemon):
++            self.target, self.args = target, args
++
++        def start(self):
++            self.target(*self.args)
++
++    monkeypatch.setattr(push.threading, "Thread", _Immediate)
++    monkeypatch.setattr(push, "_send", lambda messages: sent.extend(messages))
++    push.notify_users(_FakeDb(["ExponentPushToken[a]", "ExponentPushToken[b]"]), ["u1"], "Hi", "There", {"x": 1})
++    assert [m["to"] for m in sent] == ["ExponentPushToken[a]", "ExponentPushToken[b]"]
++    assert sent[0]["title"] == "Hi" and sent[0]["data"] == {"x": 1}
++
++
++def test_notify_does_nothing_without_tokens_or_when_disabled(monkeypatch):
++    monkeypatch.setattr(push.threading, "Thread", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no thread expected")))
++    push.notify_users(_FakeDb([]), ["u1"], "Hi", "There")
++    monkeypatch.setenv("PUSH_NOTIFICATIONS_ENABLED", "false")
++    push.notify_users(_FakeDb(["ExponentPushToken[a]"]), ["u1"], "Hi", "There")
+diff -ruN a/backend/tests/test_social_audiences.py b/backend/tests/test_social_audiences.py
+--- a/backend/tests/test_social_audiences.py	1970-01-01 00:00:00.000000000 +0000
++++ b/backend/tests/test_social_audiences.py	2026-11-06 07:34:56.336436169 +0000
+@@ -0,0 +1,25 @@
++"""Unit test for the multi-audience client-id setting (no network, no database).
++
++    python -m pytest tests/test_social_audiences.py -q
++"""
++import os
++
++os.environ.setdefault("SECRET_KEY", "test-secret-key-for-social-tests-0123456789abcdef")
++
++from app import social_auth  # noqa: E402
++
++
++def test_parse_client_ids():
++    assert social_auth.parse_client_ids(None) == []
++    assert social_auth.parse_client_ids("") == []
++    assert social_auth.parse_client_ids("com.eravenda.web") == ["com.eravenda.web"]
++    assert social_auth.parse_client_ids(" com.eravenda.web , com.eravenda.app ,, ") == ["com.eravenda.web", "com.eravenda.app"]
++
++
++def test_missing_config_is_reported_not_crashed():
++    try:
++        social_auth._verify("x.y.z", "https://example.invalid/keys", {"iss"}, [], "apple")
++    except social_auth.TokenVerificationError as exc:
++        assert "APPLE_CLIENT_ID is not configured" in str(exc)
++    else:
++        raise AssertionError("expected TokenVerificationError")
+diff -ruN a/frontend/templates/admin/reports.html b/frontend/templates/admin/reports.html
+--- a/frontend/templates/admin/reports.html	1970-01-01 00:00:00.000000000 +0000
++++ b/frontend/templates/admin/reports.html	2026-11-06 07:34:56.338932786 +0000
+@@ -0,0 +1,101 @@
++{% extends "base.html" %}
++{% block title %}Content reports — Eravenda Admin{% endblock %}
++{% block robots_meta %}noindex, nofollow{% endblock %}
++{% block content %}
++<div class="bg-slate-50 min-h-full">
++<section class="max-w-4xl mx-auto px-4 py-8">
++
++  <div class="flex flex-col sm:flex-row sm:items-end justify-between gap-4 mb-6">
++    <div>
++      <p class="text-brand-700 text-sm font-bold tracking-wider">ERAVENDA ADMINISTRATION</p>
++      <h1 class="font-head text-2xl sm:text-3xl font-bold mt-1">Content reports</h1>
++      <p class="text-slate-500 mt-2 text-sm">Products, stores and reviews that buyers reported from the app. Review each one, act on it if it breaks the Terms, and record what you decided.</p>
++    </div>
++    <div class="flex items-center gap-2 shrink-0">
++      <select id="statusFilter" class="border border-slate-300 bg-white rounded-lg px-3 py-2 text-sm font-semibold">
++        <option value="open">Open</option>
++        <option value="reviewing">Reviewing</option>
++        <option value="actioned">Actioned</option>
++        <option value="dismissed">Dismissed</option>
++        <option value="all">All</option>
++      </select>
++      <a href="/admin/dashboard.html" class="border border-slate-300 bg-white px-4 py-2 rounded-lg text-sm font-semibold">Dashboard</a>
++    </div>
++  </div>
++
++  <p id="message" class="text-sm text-slate-500 mb-4"></p>
++  <div id="list" class="space-y-4"></div>
++
++</section>
++</div>
++
++<script>
++if (!Auth.isLoggedIn()) location.href = '/login?next=/admin/reports.html';
++const _u = Auth.getUser(); if (!_u || _u.role !== 'admin') location.href = '/';
++
++const esc = s => String(s ?? '').replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
++const listEl = document.getElementById('list');
++const msgEl = document.getElementById('message');
++const filterEl = document.getElementById('statusFilter');
++
++const badge = s => ({ open: 'bg-amber-100 text-amber-800', reviewing: 'bg-sky-100 text-sky-800', actioned: 'bg-emerald-100 text-emerald-800', dismissed: 'bg-slate-200 text-slate-700' }[s] || 'bg-slate-100');
++
++function card(r) {
++  const btn = (action, status, label, cls) =>
++    `<button data-id="${esc(r.id)}" data-action="${action}" data-status="${status}" class="report-btn ${cls} px-3 py-1.5 rounded-lg text-xs font-bold">${label}</button>`;
++  const actions = [];
++  if (r.target_type === 'product') actions.push(btn('hide_product', 'actioned', 'Hide product', 'bg-red-600 text-white'));
++  if (r.target_type === 'review') actions.push(btn('clear_review_comment', 'actioned', 'Clear comment', 'bg-red-600 text-white'));
++  if (r.store_id) actions.push(btn('suspend_store', 'actioned', 'Suspend store', 'bg-red-800 text-white'));
++  actions.push(btn('none', 'reviewing', 'Mark reviewing', 'border border-slate-300 bg-white'));
++  actions.push(btn('none', 'dismissed', 'Dismiss', 'border border-slate-300 bg-white'));
++  return `
++  <article class="bg-white border border-slate-200 rounded-2xl p-5">
++    <div class="flex items-start justify-between gap-3">
++      <div>
++        <h2 class="font-bold text-slate-900">${esc(r.target_label)}</h2>
++        <p class="text-xs text-slate-500 mt-0.5">${r.store_name ? 'Store: ' + esc(r.store_name) + ' · ' : ''}Reported ${new Date(r.created_at).toLocaleString()}${r.reporter_email ? ' by ' + esc(r.reporter_email) : ''}</p>
++      </div>
++      <span class="text-xs font-bold px-2 py-1 rounded-full ${badge(r.status)}">${esc(r.status)}</span>
++    </div>
++    <p class="mt-3 text-sm"><strong>${esc(r.reason_label)}</strong>${r.details ? ' — ' + esc(r.details) : ''}</p>
++    ${r.admin_note ? `<p class="mt-2 text-sm text-slate-600"><em>Admin note:</em> ${esc(r.admin_note)}</p>` : ''}
++    <div class="mt-4 space-y-3">
++      <input id="note-${esc(r.id)}" type="text" maxlength="1000" placeholder="Note about your decision (optional)" value="" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm">
++      <div class="flex flex-wrap gap-2">${actions.join('')}</div>
++    </div>
++  </article>`;
++}
++
++async function load() {
++  msgEl.textContent = 'Loading…';
++  try {
++    const rows = await apiFetch('/admin/reports?status=' + encodeURIComponent(filterEl.value));
++    msgEl.textContent = rows.length ? `${rows.length} report(s)` : 'Nothing here. All caught up.';
++    listEl.innerHTML = rows.map(card).join('');
++  } catch (e) {
++    msgEl.textContent = e.message;
++    listEl.innerHTML = '';
++  }
++}
++
++listEl.addEventListener('click', async (ev) => {
++  const b = ev.target.closest('.report-btn');
++  if (!b) return;
++  const { id, action, status } = b.dataset;
++  if (action !== 'none' && !confirm('This changes live content and cannot be undone from here. Continue?')) return;
++  b.disabled = true;
++  try {
++    const note = document.getElementById('note-' + id).value;
++    await apiFetch('/admin/reports/' + encodeURIComponent(id), { method: 'PUT', body: { status, action, admin_note: note || null } });
++    await load();
++  } catch (e) {
++    alert(e.message);
++    b.disabled = false;
++  }
++});
++
++filterEl.addEventListener('change', load);
++load();
++</script>
++{% endblock %}
+diff -ruN a/frontend/templates/delete-account.html b/frontend/templates/delete-account.html
+--- a/frontend/templates/delete-account.html	1970-01-01 00:00:00.000000000 +0000
++++ b/frontend/templates/delete-account.html	2026-11-06 07:34:56.337801804 +0000
+@@ -0,0 +1,67 @@
++{% extends "base.html" %}
++{% block title %}Delete your account — EraVenda{% endblock %}
++{% block meta_description %}How to delete your EraVenda account and what happens to your data.{% endblock %}
++
++{% block content %}
++<div class="max-w-3xl mx-auto px-4 py-12">
++  <h1 class="font-head text-2xl sm:text-3xl font-bold mb-2">Delete your account</h1>
++  <p class="text-sm text-slate-500 mb-8">You can delete your EraVenda account yourself at any time.</p>
++
++  <div class="prose prose-slate max-w-none space-y-6 text-slate-700 text-sm leading-relaxed">
++
++    <section>
++      <h2 class="font-head text-lg font-bold text-slate-900 mb-2">How to delete it</h2>
++      <ol class="list-decimal pl-5 space-y-1">
++        <li>Open the EraVenda app and sign in.</li>
++        <li>Go to <strong>Account</strong>, then <strong>Delete account</strong>.</li>
++        <li>Read what will happen, enter your password, type <strong>DELETE</strong> and confirm.</li>
++      </ol>
++      <p class="mt-3">
++        Can't use the app, or can't sign in? <a href="/contact" class="text-brand-600 font-semibold hover:underline">Contact us</a>
++        from the email address on your account and we will help you close it.
++      </p>
++    </section>
++
++    <section>
++      <h2 class="font-head text-lg font-bold text-slate-900 mb-2">What is deleted</h2>
++      <ul class="list-disc pl-5 space-y-1">
++        <li>Your name, email address, phone number, password, profile photo and location.</li>
++        <li>Your saved addresses, cart, wishlist and the stores you follow.</li>
++        <li>Your notification settings and the phones registered for notifications.</li>
++        <li>The text of reviews you wrote, newsletter sign-ups and contact-form messages sent from your email.</li>
++        <li>If you sold on EraVenda: your store's name, description, logo, banner and registration number. Your store is closed and its products are hidden.</li>
++      </ul>
++    </section>
++
++    <section>
++      <h2 class="font-head text-lg font-bold text-slate-900 mb-2">What we keep</h2>
++      <p>
++        We keep order, payment and receipt records for as long as the law requires, typically up to six years under
++        Ghanaian law, for tax, accounting and dispute purposes. After deletion they are no longer linked to your name,
++        email or phone number. The delivery details on past orders are reduced to the region and city. Star ratings you gave
++        stay so that product ratings remain accurate. Payment details are held by our payment provider, Paystack,
++        under its own policy; we never see your full card or mobile-money details.
++      </p>
++    </section>
++
++    <section>
++      <h2 class="font-head text-lg font-bold text-slate-900 mb-2">When you can't delete yet</h2>
++      <p>
++        We ask you to finish what is in progress first, so nobody is left waiting for an order or a payout. Deletion is
++        unavailable while you have orders that are unpaid, being prepared or on the way, service bookings that are not
++        finished, or (for stores) orders or payouts still in progress. The app tells you exactly what to finish.
++      </p>
++    </section>
++
++    <section>
++      <h2 class="font-head text-lg font-bold text-slate-900 mb-2">It cannot be undone</h2>
++      <p>
++        Once your account is deleted we cannot restore it. You are welcome to create a new account at any time.
++        Questions? <a href="/contact" class="text-brand-600 font-semibold hover:underline">Contact us</a> or read our
++        <a href="/privacy" class="text-brand-600 font-semibold hover:underline">Privacy Policy</a>.
++      </p>
++    </section>
++
++  </div>
++</div>
++{% endblock %}
+diff -ruN a/frontend/templates/privacy.html b/frontend/templates/privacy.html
+--- a/frontend/templates/privacy.html	2026-11-06 07:34:56.328364374 +0000
++++ b/frontend/templates/privacy.html	2026-11-06 07:34:56.337710579 +0000
+@@ -73,7 +73,9 @@
+         We keep your account and order data for as long as your account is active. After
+         you close your account, we retain transaction records as needed to meet legal,
+         tax, and accounting obligations — typically up to six years under Ghanaian law.
+-        You can request earlier deletion by contacting us, though some records must be
++        You can delete your account yourself in the EraVenda app (Account, then Delete
++        account); <a href="/delete-account" class="text-brand-600 font-semibold hover:underline">here is what that removes and what we keep</a>.
++        You can also request deletion by contacting us, though some records must be
+         kept by law.
+       </p>
+     </section>
+diff -ruN a/frontend/templates/terms.html b/frontend/templates/terms.html
+--- a/frontend/templates/terms.html	2026-11-06 07:34:56.328482567 +0000
++++ b/frontend/templates/terms.html	2026-11-06 07:34:56.337758178 +0000
+@@ -137,6 +137,15 @@
+         Violations are grounds for suspension or permanent removal from the platform, at
+         our sole discretion.
+       </p>
++      <p class="mt-3">
++        <strong>No objectionable content.</strong> There is no place on EraVenda for illegal,
++        abusive, sexually explicit, hateful or misleading listings, store pages or reviews.
++        Stores and products are reviewed before they go live, and you can report any product,
++        store or review in the EraVenda app. You can also hide a store you don't want to see.
++        We review every report and remove content that breaks these terms; we may suspend the
++        stores or accounts responsible. Reports and questions can also be sent through our
++        <a href="/contact" class="text-brand-600 font-semibold hover:underline">contact page</a>.
++      </p>
+     </section>
+ 
+     <section>

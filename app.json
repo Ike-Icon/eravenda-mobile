@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "EraVenda",
+    "slug": "eravenda-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "eravenda",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.eravenda.market",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.eravenda.market",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "monochromeImage": "./assets/adaptive-icon-monochrome.png",
+        "backgroundColor": "#0D6952"
+      }
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "EraVenda needs your photos so you can add pictures to your products and store.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#0F5C3F"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "33943092-5ea8-447f-86c6-170033333ef9"
+      }
+    },
+    "owner": "ike-ikon"
+  }
+}
