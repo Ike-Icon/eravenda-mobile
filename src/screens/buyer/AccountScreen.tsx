@@ -28,6 +28,7 @@ export function AccountScreen({ navigation }: Props) {
         <Button title="Sign in" onPress={() => navigation.navigate('Login')} style={{ alignSelf: 'stretch' }} />
         <Button title="Create an account" variant="outline" onPress={() => navigation.navigate('Register')} style={{ alignSelf: 'stretch' }} />
         <View style={styles.guestDivider} />
+        <MenuRow icon="heart-outline" label="My wishlist" hint="See products saved on this device" onPress={() => navigation.navigate('Wishlist')} />
         <MenuRow icon="storefront-outline" label="Browse all products" hint="Shop products from Ghanaian merchants" onPress={() => navigation.navigate('Products')} />
         <MenuRow icon="construct-outline" label="Handyman Hub" hint="Find trusted local professionals" onPress={() => navigation.navigate('HandymanHub')} />
       </ScrollView>
@@ -83,14 +84,14 @@ export function AccountScreen({ navigation }: Props) {
 
 const styles = StyleSheet.create({
   content: { paddingBottom: 30 },
-  guestContent: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 18, paddingVertical: 28 },
+  guestContent: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 22, paddingVertical: 18, gap: 10 },
   guestIcon: { width: 76, height: 76, borderRadius: 38, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center', alignSelf: 'center', marginBottom: 14 },
   guestTitle: { color: colors.text, fontSize: font.xl, fontWeight: '900', textAlign: 'center' },
   guestCopy: { color: colors.textMuted, fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 7, marginBottom: 20 },
   guestDivider: { height: 1, backgroundColor: colors.border, marginVertical: 18 },
   profileCard: { flexDirection: 'row', alignItems: 'center', gap: 13, margin: 14, marginBottom: 4, padding: 15, borderRadius: radius.lg, backgroundColor: colors.surface, ...shadow.card },
   avatar: { width: 64, height: 64, borderRadius: 32, backgroundColor: colors.primarySoft },
-  avatarFallback: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primary },
+  avatarFallback: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primaryButton },
   initial: { color: colors.white, fontSize: 25, fontWeight: '900' },
   profileText: { flex: 1, minWidth: 0 },
   eyebrow: { color: colors.primary, fontSize: 9, fontWeight: '900', letterSpacing: 1 },

@@ -69,7 +69,7 @@ const styles = StyleSheet.create({
   storeName: { color: colors.text, fontSize: 14, fontWeight: '900' },
   location: { color: colors.textMuted, fontSize: 11, marginTop: 3 },
   followed: { color: colors.textMuted, fontSize: 10, marginTop: 3 },
-  unfollow: { alignSelf: 'flex-end', minWidth: 92, minHeight: 34, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 10, borderRadius: radius.pill, backgroundColor: '#FFF2F2' },
+  unfollow: { alignSelf: 'flex-end', minWidth: 92, minHeight: 34, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 10, borderRadius: radius.pill, backgroundColor: colors.dangerSoft },
   unfollowText: { color: colors.danger, fontSize: 11, fontWeight: '800' },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 28, gap: 8 },
   emptyTitle: { color: colors.text, fontSize: 16, fontWeight: '900', textAlign: 'center' },

@@ -11,11 +11,12 @@
 import { Ionicons } from '@expo/vector-icons';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
-import { NavigationContainer, DefaultTheme, createNavigationContainerRef } from '@react-navigation/native';
+import { NavigationContainer, DefaultTheme, DarkTheme, createNavigationContainerRef } from '@react-navigation/native';
 import React, { useState } from 'react';
 import { colors } from '../config/theme';
 import { useAuth } from '../context/AuthContext';
 import { useCart } from '../context/CartContext';
+import { usePreferences } from '../context/PreferencesContext';
 import { ForgotPasswordScreen } from '../screens/auth/ForgotPasswordScreen';
 import { LoginScreen } from '../screens/auth/LoginScreen';
 import { RegisterScreen } from '../screens/auth/RegisterScreen';
@@ -37,6 +38,7 @@ import { OrderDetailsScreen } from '../screens/buyer/OrderDetailsScreen';
 import { OrdersScreen } from '../screens/buyer/OrdersScreen';
 import { WishlistScreen } from '../screens/buyer/WishlistScreen';
 import { NotificationsScreen } from '../screens/buyer/NotificationsScreen';
+import { DeliveryPartnerScreen } from '../screens/buyer/DeliveryPartnerScreen';
 import { ReportScreen } from '../screens/buyer/ReportScreen';
 import { ReviewScreen } from '../screens/buyer/ReviewScreen';
 import { ServiceBookingDetailScreen, HandymanDashboardScreen, HandymanHubScreen, HandymanProfileScreen, HandymanRegisterScreen, ServiceBookingsScreen, ServiceRequestScreen } from '../screens/services/HandymanScreens';
@@ -69,6 +71,7 @@ const ICONS: Record<keyof TabParamList, [keyof typeof Ionicons.glyphMap, keyof t
 function Tabs() {
   const { count } = useCart();
   const { user } = useAuth();
+  const { isDark } = usePreferences();
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
@@ -79,7 +82,7 @@ function Tabs() {
         tabBarInactiveTintColor: colors.textMuted,
         tabBarLabelStyle: { fontSize: 11, fontWeight: '700' },
         // Do not set a fixed height here: the navigator adds the bottom safe-area inset (home indicator) itself.
-        tabBarStyle: { backgroundColor: colors.surface, borderTopColor: colors.border },
+        tabBarStyle: { backgroundColor: isDark ? '#17221D' : colors.surface, borderTopColor: isDark ? '#2D3B34' : colors.border },
         tabBarIcon: ({ focused, color, size }) => <Ionicons name={ICONS[route.name][focused ? 0 : 1]} size={size} color={color} />,
       })}
     >
@@ -95,6 +98,7 @@ function Tabs() {
 
 export function RootNavigator() {
   const { status } = useAuth();
+  const { isDark } = usePreferences();
   const [navReady, setNavReady] = useState(false);
   usePushNotifications(status === 'signedIn', navigationRef, navReady);
 
@@ -106,7 +110,7 @@ export function RootNavigator() {
   }
 
   return (
-    <NavigationContainer ref={navigationRef} onReady={() => setNavReady(true)} theme={{ ...DefaultTheme, colors: { ...DefaultTheme.colors, background: colors.background, primary: colors.primary } }}>
+    <NavigationContainer ref={navigationRef} onReady={() => setNavReady(true)} theme={{ ...(isDark ? DarkTheme : DefaultTheme), colors: { ...(isDark ? DarkTheme.colors : DefaultTheme.colors), background: isDark ? '#101714' : colors.background, card: isDark ? '#17221D' : colors.surface, border: isDark ? '#2D3B34' : colors.border, text: isDark ? '#F0F5F2' : colors.text, primary: colors.primary } }}>
       <Stack.Navigator screenOptions={{
         headerShown: true,
         header: () => <AppHeader />,
@@ -117,6 +121,7 @@ export function RootNavigator() {
         <Stack.Screen name="Products" component={ProductsScreen} />
         <Stack.Screen name="FollowedStores" component={FollowedStoresScreen} />
         <Stack.Screen name="Settings" component={SettingsScreen} />
+        <Stack.Screen name="DeliveryPartner" component={DeliveryPartnerScreen} />
         <Stack.Screen name="FooterInfo" component={FooterInfoScreen} />
         <Stack.Screen name="ProductDetails" component={ProductDetailsScreen} />
         <Stack.Screen name="Checkout" component={CheckoutScreen} />

@@ -1,12 +1,12 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import React, { useState } from 'react';
-import { KeyboardAvoidingView, Linking, Platform, ScrollView, StyleSheet, Text } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text } from 'react-native';
 import { Button } from '../../components/Button';
+import { AuthLegalNotice } from '../../components/AuthLegalNotice';
 import { SocialButtons } from '../../components/SocialButtons';
 import { Screen } from '../../components/Screen';
 import { TextField } from '../../components/TextField';
 import { Header } from '../../components/Section';
-import { SITE_ORIGIN } from '../../config/env';
 import { colors, font } from '../../config/theme';
 import { useAuth } from '../../context/AuthContext';
 import type { RootStackParamList } from '../../navigation/types';
@@ -50,13 +50,7 @@ export function RegisterScreen({ navigation }: Props) {
           {!!error && <Text style={styles.error}>{error}</Text>}
           <Button title="Sign up" onPress={submit} loading={busy} />
           <SocialButtons onSuccess={() => navigation.goBack()} onError={setError} />
-          {/* Stores expect users of apps with user-generated content to accept terms that ban objectionable content. */}
-          <Text style={styles.terms}>
-            By creating an account you agree to our{' '}
-            <Text style={styles.link} onPress={() => Linking.openURL(`${SITE_ORIGIN}/terms`)}>Terms</Text>
-            {' '}(no objectionable content) and{' '}
-            <Text style={styles.link} onPress={() => Linking.openURL(`${SITE_ORIGIN}/privacy`)}>Privacy Policy</Text>.
-          </Text>
+          <AuthLegalNotice />
           <Button title="I already have an account" variant="ghost" onPress={() => navigation.replace('Login')} />
         </ScrollView>
       </KeyboardAvoidingView>
@@ -69,6 +63,4 @@ const styles = StyleSheet.create({
   title: { fontSize: font.xxl, fontWeight: '800', color: colors.primary },
   sub: { color: colors.textMuted, marginTop: 4, marginBottom: 24, fontSize: font.md },
   error: { color: colors.danger, marginBottom: 12 },
-  terms: { color: colors.textMuted, fontSize: 12, lineHeight: 18, marginTop: 12, textAlign: 'center' },
-  link: { color: colors.primary, fontWeight: '700', textDecorationLine: 'underline' },
 });

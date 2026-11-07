@@ -2,6 +2,7 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import React, { useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../../components/Button';
+import { AuthLegalNotice } from '../../components/AuthLegalNotice';
 import { SocialButtons } from '../../components/SocialButtons';
 import { Screen } from '../../components/Screen';
 import { TextField } from '../../components/TextField';
@@ -36,8 +37,8 @@ export function LoginScreen({ navigation }: Props) {
   return (
     <Screen edges={['bottom', 'left', 'right']}>
       <Header title="Sign in" onBack={() => navigation.goBack()} />
-      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
-        <ScrollView contentContainerStyle={styles.body} keyboardShouldPersistTaps="handled">
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={{ flex: 1 }}>
+        <ScrollView contentContainerStyle={styles.body} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <Text style={styles.title}>Welcome back</Text>
           <Text style={styles.sub}>Sign in to your EraVenda account</Text>
           <TextField label="Email" value={email} onChangeText={setEmail} autoCapitalize="none" keyboardType="email-address" autoComplete="email" />
@@ -45,6 +46,7 @@ export function LoginScreen({ navigation }: Props) {
           {!!error && <Text style={styles.error}>{error}</Text>}
           <Button title="Sign in" onPress={submit} loading={busy} />
           <SocialButtons onSuccess={() => navigation.goBack()} onError={setError} />
+          <AuthLegalNotice />
           <View style={{ height: 8 }} />
           <Button title="Forgot password?" variant="ghost" onPress={() => navigation.navigate('ForgotPassword')} />
           <View style={{ height: 8 }} />
@@ -56,7 +58,7 @@ export function LoginScreen({ navigation }: Props) {
 }
 
 const styles = StyleSheet.create({
-  body: { padding: 24, paddingTop: 48 },
+  body: { flexGrow: 1, paddingHorizontal: 22, paddingTop: 16, paddingBottom: 20 },
   title: { fontSize: font.xxl, fontWeight: '800', color: colors.primary },
   sub: { color: colors.textMuted, marginTop: 4, marginBottom: 28, fontSize: font.md },
   error: { color: colors.danger, marginBottom: 12 },

@@ -67,7 +67,7 @@ export function SellerDashboardScreen({ navigation }: Props) {
 
 const styles = StyleSheet.create({
   err: { color: colors.danger, padding: 20 },
-  warn: { backgroundColor: '#FEF3C7', color: '#92400E', margin: 16, padding: 12, borderRadius: radius.md },
+  warn: { backgroundColor: colors.warningSurface, color: colors.warningText, margin: 16, padding: 12, borderRadius: radius.md },
   stats: { flexDirection: 'row', gap: 12, paddingHorizontal: 16, marginBottom: 12 },
   stat: { flex: 1, backgroundColor: colors.surface, borderRadius: radius.lg, padding: 14 },
   statLabel: { color: colors.textMuted, fontSize: 13 },

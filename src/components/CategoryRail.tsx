@@ -1,11 +1,12 @@
 import { Image } from 'expo-image';
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { colors, radius } from '../config/theme';
 import type { Category } from '../types/api';
 import { absoluteUrl } from '../utils/format';
 import { Skeleton } from './Skeleton';
+import { usePreferences } from '../context/PreferencesContext';
 
 interface Props {
   categories: Category[] | null; // null = still loading
@@ -45,6 +46,7 @@ export const CATEGORY_IMAGES: Record<string, number> = {
 
 /** Horizontal category chips. Tapping the active one clears the filter. */
 export function CategoryRail({ categories, selectedId, onSelect }: Props) {
+  const { isDark } = usePreferences();
   if (!categories) {
     return (
       <View style={styles.row}>
@@ -65,10 +67,10 @@ export function CategoryRail({ categories, selectedId, onSelect }: Props) {
         const active = item.id === selectedId;
         return (
           <Pressable onPress={() => onSelect(active ? null : item.id)} style={styles.item} accessibilityRole="button" accessibilityLabel={item.name}>
-            <View style={[styles.circle, active && styles.circleActive]}>
+            <View style={[styles.circle, isDark && styles.circleDark, active && styles.circleActive]}>
               <CategoryIcon uri={absoluteUrl(item.icon_url)} slug={item.slug} />
             </View>
-            <Text numberOfLines={2} style={[styles.label, active && { color: colors.primary, fontWeight: '800' }]}>
+            <Text numberOfLines={2} style={[styles.label, isDark && styles.labelDark, active && { color: colors.primary, fontWeight: '800' }]}>
               {item.name}
             </Text>
           </Pressable>
@@ -80,10 +82,12 @@ export function CategoryRail({ categories, selectedId, onSelect }: Props) {
 
 export function CategoryIcon({ uri, slug }: { uri?: string; slug: string }) {
   const [failed, setFailed] = useState(false);
+  useEffect(() => setFailed(false), [uri, slug]);
+  const localImage = CATEGORY_IMAGES[slug.trim().toLowerCase().replace(/_/g, '-')];
   return uri && !failed ? (
     <Image source={{ uri }} style={styles.icon} contentFit="cover" onError={() => setFailed(true)} />
-  ) : CATEGORY_IMAGES[slug] ? (
-    <Image source={CATEGORY_IMAGES[slug]} style={styles.icon} contentFit="cover" />
+  ) : localImage ? (
+    <Image source={localImage} style={styles.icon} contentFit="cover" />
   ) : (
     <Ionicons name="pricetag-outline" size={24} color={colors.primary} style={{ alignSelf: 'center', marginTop: 16 }} />
   );
@@ -93,7 +97,9 @@ const styles = StyleSheet.create({
   row: { paddingHorizontal: 16, paddingVertical: 12, flexDirection: 'row' },
   item: { width: 72, alignItems: 'center', marginRight: 12 },
   circle: { width: 60, height: 60, borderRadius: 30, backgroundColor: colors.primarySoft, overflow: 'hidden', borderWidth: 2, borderColor: 'transparent' },
+  circleDark: { backgroundColor: '#26352E' },
   circleActive: { borderColor: colors.primary },
   icon: { width: '100%', height: '100%' },
   label: { marginTop: 6, fontSize: 11, textAlign: 'center', color: colors.text },
+  labelDark: { color: '#E7F0EA' },
 });

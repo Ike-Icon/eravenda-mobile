@@ -14,10 +14,11 @@ import type { CompositeScreenProps } from '@react-navigation/native';
 import type { BottomTabScreenProps } from '@react-navigation/bottom-tabs';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Linking, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, Animated, FlatList, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { Image } from 'expo-image';
 import { BannerCarousel } from '../../components/BannerCarousel';
 import { CategoryGrid } from '../../components/CategoryGrid';
+import { FloatingContactActions } from '../../components/FloatingContactActions';
 import { ProductCard } from '../../components/ProductCard';
 import { Screen } from '../../components/Screen';
 import { SearchBar } from '../../components/SearchBar';
@@ -26,11 +27,13 @@ import { colors, radius, shadow } from '../../config/theme';
 import { useAuth } from '../../context/AuthContext';
 import { useBlocks } from '../../context/BlockContext';
 import { useCart } from '../../context/CartContext';
+import { usePreferences } from '../../context/PreferencesContext';
 import type { RootStackParamList, TabParamList } from '../../navigation/types';
 import { catalogService } from '../../services/catalogService';
 import { handymanService } from '../../services/handymanService';
 import type { Category, Handyman, Product, Store } from '../../types/api';
 import { absoluteUrl, discountPercent, effectivePrice, formatPrice, primaryImage } from '../../utils/format';
+import { variantEntries } from '../../utils/variants';
 
 type Props = CompositeScreenProps<BottomTabScreenProps<TabParamList, 'Home'>, NativeStackScreenProps<RootStackParamList>>;
 
@@ -38,7 +41,8 @@ const PAGE_SIZE = 20;
 
 export function HomeScreen({ navigation, route }: Props) {
   const { status } = useAuth();
-  const { wishlistIds, toggleWishlist } = useCart();
+  const { wishlistIds, toggleWishlist, addItem } = useCart();
+  const { isDark } = usePreferences();
   const { blockedIds } = useBlocks();
 
   const [categories, setCategories] = useState<Category[] | null>(null);
@@ -70,44 +74,34 @@ export function HomeScreen({ navigation, route }: Props) {
   }, [route.params?.categoryId, route.params?.salesType]);
 
   // The homepage category grid includes parent categories and their child categories.
-  useEffect(() => {
-    const controller = new AbortController();
-    catalogService.categories(controller.signal).then(setCategories).catch(() => { if (!controller.signal.aborted) setCategories([]); });
-    return () => controller.abort();
+  const refreshSupplemental = useCallback(() => {
+    void catalogService.categories().then(setCategories).catch(() => undefined);
+    void catalogService.products({ page: 1, page_size: 10, sales_type: 'retail', sort: 'rating' })
+      .then((rated) => setTopRated(rated.items.filter((p) => p.review_count > 0))).catch(() => undefined);
+    void catalogService.products({ page: 1, page_size: 10, sales_type: 'retail', cod_eligible: true })
+      .then((cod) => setPayOnDelivery(cod.items)).catch(() => undefined);
+    void handymanService.workers()
+      .then((workers) => setFeaturedHandymen([...workers].sort((a, b) => Number(b.average_rating) - Number(a.average_rating) || b.review_count - a.review_count).slice(0, 6)))
+      .catch(() => undefined);
   }, []);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    Promise.all([
-      catalogService.products({ page: 1, page_size: 10, sales_type: 'retail', sort: 'rating' }, controller.signal),
-      catalogService.products({ page: 1, page_size: 10, sales_type: 'retail', cod_eligible: true }, controller.signal),
-    ]).then(([rated, cod]) => {
-      if (!controller.signal.aborted) {
-        setTopRated(rated.items.filter((p) => p.review_count > 0));
-        setPayOnDelivery(cod.items);
-      }
-    }).catch(() => undefined);
-    return () => controller.abort();
+  useEffect(() => { refreshSupplemental(); }, [refreshSupplemental]);
+
+  const featuredStoreKey = useRef('');
+  const loadFeaturedStores = useCallback(async (source: Product[], force = false) => {
+    const ids = [...new Set(source.map((p) => p.store_id))].slice(0, 6);
+    const key = ids.join('|');
+    if (!key) { setFeaturedStores([]); return; }
+    if (!force && featuredStoreKey.current === key) return;
+    featuredStoreKey.current = key;
+    const results = await Promise.allSettled(ids.map((id) => catalogService.store(id)));
+    setFeaturedStores(results.flatMap((result) => result.status === 'fulfilled' && result.value.status === 'approved' ? [result.value] : []));
   }, []);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    handymanService.workers(controller.signal).then((workers) => setFeaturedHandymen([...workers].sort((a, b) => Number(b.average_rating) - Number(a.average_rating) || b.review_count - a.review_count).slice(0, 6))).catch(() => undefined);
-    return () => controller.abort();
-  }, []);
-
-  const storesLoaded = useRef(false);
-  useEffect(() => {
-    if (storesLoaded.current || products.length === 0) return;
-    storesLoaded.current = true;
-    const ids = [...new Set(products.map((p) => p.store_id))].slice(0, 6);
-    Promise.allSettled(ids.map((id) => catalogService.store(id))).then((results) => {
-      setFeaturedStores(results.flatMap((result) => result.status === 'fulfilled' && result.value.status === 'approved' ? [result.value] : []));
-    });
-  }, [products]);
+  useEffect(() => { if (products.length) void loadFeaturedStores(products); }, [loadFeaturedStores, products]);
 
   const load = useCallback(
-    async (page: number, mode: 'replace' | 'append', signal?: AbortSignal) => {
+    async (page: number, mode: 'replace' | 'append', signal?: AbortSignal): Promise<Product[] | null> => {
       try {
         const res = await catalogService.products({
           page,
@@ -121,8 +115,10 @@ export function HomeScreen({ navigation, route }: Props) {
         setTotal(res.total);
         setProducts((prev) => (mode === 'append' ? [...prev, ...res.items] : res.items));
         setError(null);
+        return res.items;
       } catch (e: any) {
         if (e.name !== 'AbortError') setError(e.message);
+        return null;
       }
     },
     [categoryId, discoveryFilter, query, salesType],
@@ -143,18 +139,40 @@ export function HomeScreen({ navigation, route }: Props) {
     setLoadingMore(false);
   };
 
-  const onRefresh = async () => {
+  const refreshInFlight = useRef(false);
+  const onRefresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
     setRefreshing(true);
-    await load(1, 'replace');
-    setRefreshing(false);
-  };
-
-  const heart = async (productId: string) => {
-    if (status !== 'signedIn') return navigation.navigate('Login');
+    refreshSupplemental();
     try {
-      await toggleWishlist(productId);
+      const refreshedProducts = await load(1, 'replace');
+      if (refreshedProducts) void loadFeaturedStores(refreshedProducts, true);
+    } finally {
+      refreshInFlight.current = false;
+      setRefreshing(false);
+    }
+  }, [load, loadFeaturedStores, refreshSupplemental]);
+
+  const heart = async (product: Product) => {
+    try {
+      await toggleWishlist(product.id, product);
     } catch (e: any) {
       Alert.alert('Wishlist', e.message);
+    }
+  };
+
+  const quickAdd = async (product: Product) => {
+    const color = variantEntries(product.colors).find((v) => v.available)?.label ?? null;
+    const size = variantEntries(product.sizes).find((v) => v.available)?.label ?? null;
+    const option = variantEntries(product.options).find((v) => v.available)?.label ?? null;
+    const quantity = product.sales_type === 'wholesale' ? product.wholesale_min_quantity ?? 2 : 1;
+    try {
+      await addItem({ product_id: product.id, quantity, color, size, option }, product);
+      const selected = [color, size, option].filter(Boolean).join(' · ');
+      Alert.alert('Added to cart', `${product.name}${selected ? ` · ${selected}` : ''} · ${quantity}`);
+    } catch (e: any) {
+      Alert.alert('Could not add to cart', e.message || 'Please try again.');
     }
   };
 
@@ -186,8 +204,8 @@ export function HomeScreen({ navigation, route }: Props) {
       {!query && <CategoryGrid categories={categories} selectedId={categoryId} onSelect={chooseCategory} />}
       {!query && <ValueProposition />}
       {homeBrowsing && <>
-        <ProductShowcase title="Hot Arrivals" eyebrow="JUST LANDED" subtitle="New in the last 30 days" items={hotArrivals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
-        <ProductShowcase title="Flash Deals" eyebrow="LIMITED TIME" subtitle="Special discounts. Grab them while they last." items={flashDeals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
+        <ProductShowcase title="Hot Arrivals" eyebrow="JUST LANDED" subtitle="New in the last 30 days" items={hotArrivals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} onAddToCart={quickAdd} />
+        <ProductShowcase title="Flash Deals" eyebrow="LIMITED TIME" subtitle="Special discounts. Grab them while they last." items={flashDeals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} onAddToCart={quickAdd} flashSale />
       </>}
       <View style={styles.discoverHeading}>
         <View><Text style={styles.eyebrow}>MARKETPLACE HIGHLIGHTS</Text><Text style={styles.discoverTitle}>{query ? `Results for “${query}”` : categoryId ? 'In this category' : salesType === 'wholesale' ? 'Wholesale products' : 'Discover Products'}</Text><Text style={styles.discoverSub}>Explore products from verified Ghanaian merchants</Text></View>
@@ -197,9 +215,9 @@ export function HomeScreen({ navigation, route }: Props) {
   );
 
   const footer = homeBrowsing ? <View>
-    <ProductShowcase title="Top Deals" eyebrow="SAVE MORE" subtitle="Biggest savings in the marketplace" items={topDeals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
-    <ProductShowcase title="Pay on Delivery" eyebrow="SHOP WITH CONFIDENCE" subtitle="Eligible products delivered to your door" items={payOnDelivery} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
-    <ProductShowcase title="Highly Rated" eyebrow="SHOPPER FAVOURITES" subtitle="Products rated 4 stars and above" items={topRated} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
+    <ProductShowcase title="Top Deals" eyebrow="SAVE MORE" subtitle="Biggest savings in the marketplace" items={topDeals} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} onAddToCart={quickAdd} />
+    <ProductShowcase title="Pay on Delivery" eyebrow="SHOP WITH CONFIDENCE" subtitle="Eligible products delivered to your door" items={payOnDelivery} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} onAddToCart={quickAdd} />
+    <ProductShowcase title="Highly Rated" eyebrow="SHOPPER FAVOURITES" subtitle="Products rated 4 stars and above" items={topRated} onPress={(p) => navigation.navigate('ProductDetails', { productId: p.id })} onAddToCart={quickAdd} />
     <HandymanHubFeature
       items={featuredHandymen}
       onOpen={() => navigation.navigate('HandymanHub')}
@@ -222,10 +240,10 @@ export function HomeScreen({ navigation, route }: Props) {
   return (
     <Screen edges={['left', 'right']}>
       <View style={{ flex: 1 }}>
-      <View style={styles.fixedSearch}>
+      <View style={[styles.fixedSearch, isDark && styles.fixedSearchDark]}>
         <SearchBar onSubmit={setQuery} onPickSuggestion={(p) => navigation.navigate('ProductDetails', { productId: p.id })} />
         <View style={styles.toggle}>
-          {(['retail', 'wholesale'] as const).map((t) => <Pressable key={t} onPress={() => setSalesType(t)} style={[styles.toggleBtn, salesType === t && styles.toggleOn]} accessibilityRole="button" accessibilityState={{ selected: salesType === t }}><Text style={[styles.toggleText, salesType === t && { color: colors.white }]}>{t === 'retail' ? 'Retail' : 'Wholesale'}</Text></Pressable>)}
+          {(['retail', 'wholesale'] as const).map((t) => <Pressable key={t} onPress={() => setSalesType(t)} style={[styles.toggleBtn, isDark && styles.toggleBtnDark, salesType === t && styles.toggleOn]} accessibilityRole="button" accessibilityState={{ selected: salesType === t }}><Text style={[styles.toggleText, isDark && styles.toggleTextDark, salesType === t && { color: colors.white }]}>{t === 'retail' ? 'Retail' : 'Wholesale'}</Text></Pressable>)}
         </View>
       </View>
       <FlatList
@@ -245,7 +263,8 @@ export function HomeScreen({ navigation, route }: Props) {
             product={item}
             wished={wishlistIds.has(item.id)}
             onPress={() => navigation.navigate('ProductDetails', { productId: item.id })}
-            onToggleWishlist={() => heart(item.id)}
+            onToggleWishlist={() => heart(item)}
+            onAddToCart={() => quickAdd(item)}
           />
         )}
         ListEmptyComponent={
@@ -267,10 +286,7 @@ export function HomeScreen({ navigation, route }: Props) {
         }
         ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 16 }} color={colors.primary} /> : footer ?? undefined}
       />
-      <View style={styles.floatingActions}>
-        <Pressable accessibilityLabel="Chat on WhatsApp" style={styles.floatButton} onPress={() => void Linking.openURL('https://wa.me/233554372279?text=Hello%20EraVenda%2C%20I%20need%20help%20with%20')}><Ionicons name="logo-whatsapp" size={23} color="#fff" /></Pressable>
-        <Pressable accessibilityLabel="Back to top" style={[styles.floatButton, styles.topButton]} onPress={() => listRef.current?.scrollToOffset({ offset: 0, animated: true })}><Ionicons name="arrow-up" size={22} color={colors.primary} /></Pressable>
-      </View>
+      <FloatingContactActions onBackToTop={() => listRef.current?.scrollToOffset({ offset: 0, animated: true })} />
       </View>
     </Screen>
   );
@@ -278,23 +294,33 @@ export function HomeScreen({ navigation, route }: Props) {
 
 const styles = StyleSheet.create({
   fixedSearch: { paddingHorizontal: 10, paddingTop: 8, paddingBottom: 9, backgroundColor: colors.background, zIndex: 10 },
+  fixedSearchDark: { backgroundColor: '#101714' },
   toggle: { flexDirection: 'row', marginHorizontal: 6, marginTop: 8, backgroundColor: colors.border, borderRadius: 999, padding: 3 },
   toggleBtn: { flex: 1, alignItems: 'center', paddingVertical: 8, borderRadius: 999 },
-  toggleOn: { backgroundColor: colors.primary },
+  toggleBtnDark: { backgroundColor: '#26352E' },
+  toggleOn: { backgroundColor: colors.primaryButton },
   toggleText: { fontWeight: '700', color: colors.text },
+  toggleTextDark: { color: '#D3DED7' },
   discoverHeading: { marginHorizontal: 14, marginTop: 10, marginBottom: 4, flexDirection: 'row', alignItems: 'center' },
   eyebrow: { color: colors.primary, fontSize: 10, letterSpacing: 1.2, fontWeight: '900' },
   discoverTitle: { color: colors.text, fontSize: 23, fontWeight: '900', marginTop: 3 },
   discoverSub: { color: colors.textMuted, fontSize: 12, marginTop: 3 },
   filters: { paddingHorizontal: 12, paddingVertical: 10, gap: 8 },
-  filterChip: { minHeight: 36, paddingHorizontal: 13, borderRadius: radius.pill, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.white, borderWidth: 1, borderColor: colors.border },
-  filterActive: { backgroundColor: colors.primary, borderColor: colors.primary },
+  filterChip: { minHeight: 36, paddingHorizontal: 13, borderRadius: radius.pill, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border },
+  filterActive: { backgroundColor: colors.primaryButton, borderColor: colors.primary },
   filterText: { color: colors.text, fontSize: 12, fontWeight: '700' },
   filterTextActive: { color: colors.white },
   shelfHeading: { marginHorizontal: 14, marginTop: 16, marginBottom: 10, flexDirection: 'row', alignItems: 'center' },
+  showcaseFlash: { alignSelf: 'flex-start', flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#E52323', borderRadius: radius.sm, paddingHorizontal: 6, paddingVertical: 3, marginTop: 5 },
+  flashDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: '#FFF0A5' },
+  showcaseFlashText: { color: colors.white, fontSize: 9, fontWeight: '900' },
+  showcaseAdd: { minHeight: 32, marginTop: 8, borderRadius: radius.sm, backgroundColor: colors.primaryButton, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5 },
+  showcaseAddText: { color: colors.white, fontSize: 10, fontWeight: '800' },
   shelfTitle: { color: colors.text, fontSize: 19, fontWeight: '900', marginTop: 2 },
+  shelfTitleDark: { color: '#F0F5F2' },
   shelfSub: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
-  valuePanel: { marginHorizontal: 14, marginTop: 4, marginBottom: 8, padding: 12, borderRadius: radius.lg, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', flexWrap: 'wrap' },
+  shelfSubDark: { color: '#A4B3AA' },
+  valuePanel: { marginHorizontal: 14, marginTop: 4, marginBottom: 8, padding: 12, borderRadius: radius.lg, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', flexWrap: 'wrap' },
   valueItem: { width: '50%', flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 9, paddingHorizontal: 4 },
   valueIcon: { width: 34, height: 34, borderRadius: 17, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center' },
   valueEmoji: { color: colors.primary, fontSize: 16, fontWeight: '900' },
@@ -305,16 +331,16 @@ const styles = StyleSheet.create({
   campaignImage: { width: '100%', height: '100%' },
   campaignShade: { position: 'absolute', left: 0, right: 0, bottom: 0, padding: 10, backgroundColor: 'rgba(0,0,0,0.52)' },
   campaignTitle: { color: colors.white, fontSize: 14, fontWeight: '900' },
-  storeCard: { width: 150, minHeight: 132, padding: 12, borderRadius: radius.md, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' },
+  storeCard: { width: 150, minHeight: 132, padding: 12, borderRadius: radius.md, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' },
   storeAvatar: { width: 48, height: 48, borderRadius: 24, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center', marginBottom: 7 },
   storeLogo: { width: '100%', height: '100%', borderRadius: 24 },
   storeInitial: { color: colors.primary, fontWeight: '900', fontSize: 20 },
   storeName: { maxWidth: '100%', color: colors.text, fontSize: 12, fontWeight: '800' },
   storeVerified: { color: colors.primary, fontSize: 10, fontWeight: '700', marginTop: 4 },
-  testimonialSection: { marginTop: 24, marginBottom: 8, paddingHorizontal: 16, paddingVertical: 22, backgroundColor: '#F0F7F3' },
+  testimonialSection: { marginTop: 24, marginBottom: 8, paddingHorizontal: 16, paddingVertical: 22, backgroundColor: colors.primarySoft },
   testimonialTitle: { color: colors.text, fontSize: 20, fontWeight: '900', textAlign: 'center', marginTop: 4 },
   testimonialSub: { color: colors.textMuted, fontSize: 12, textAlign: 'center', lineHeight: 18, marginTop: 5, marginBottom: 12 },
-  testimonialCard: { padding: 14, borderRadius: radius.md, backgroundColor: colors.white, marginTop: 8, ...shadow.card },
+  testimonialCard: { padding: 14, borderRadius: radius.md, backgroundColor: colors.surface, marginTop: 8, ...shadow.card },
   stars: { color: '#E7A51A', fontSize: 14, letterSpacing: 2 },
   quote: { color: colors.text, fontSize: 12, lineHeight: 18, marginTop: 7 },
   quoteBy: { color: colors.text, fontSize: 11, fontWeight: '800', marginTop: 9 },
@@ -335,7 +361,7 @@ const styles = StyleSheet.create({
   tradeDetail: { color: '#BFD9D1', fontSize: 10, marginTop: 2 },
   prosBlock: { marginTop: 17 },
   prosTitle: { color: colors.white, fontSize: 16, fontWeight: '900', marginBottom: 9 },
-  proCard: { width: 240, padding: 10, borderRadius: radius.md, backgroundColor: colors.white },
+  proCard: { width: 240, padding: 10, borderRadius: radius.md, backgroundColor: colors.surface },
   proInfo: { flexDirection: 'row', alignItems: 'center', gap: 9 },
   proImage: { width: 54, height: 54, borderRadius: 27, backgroundColor: colors.primarySoft },
   proPlaceholder: { alignItems: 'center', justifyContent: 'center' },
@@ -346,7 +372,7 @@ const styles = StyleSheet.create({
   proButtons: { flexDirection: 'row', gap: 7, marginTop: 10 },
   profileButton: { flex: 1, minHeight: 34, borderRadius: radius.sm, borderWidth: 1, borderColor: colors.border, alignItems: 'center', justifyContent: 'center' },
   profileButtonText: { color: colors.text, fontSize: 11, fontWeight: '800' },
-  bookProButton: { flex: 1, minHeight: 34, borderRadius: radius.sm, backgroundColor: colors.primary, alignItems: 'center', justifyContent: 'center' },
+  bookProButton: { flex: 1, minHeight: 34, borderRadius: radius.sm, backgroundColor: colors.primaryButton, alignItems: 'center', justifyContent: 'center' },
   bookProText: { color: colors.white, fontSize: 11, fontWeight: '800' },
   howBlock: { marginTop: 18, padding: 12, borderRadius: radius.md, backgroundColor: 'rgba(255,255,255,0.08)' },
   howTitle: { color: '#BCE9D9', fontSize: 10, fontWeight: '900', letterSpacing: 0.8 },
@@ -357,24 +383,38 @@ const styles = StyleSheet.create({
   skeletons: { paddingTop: 4 },
   empty: { alignItems: 'center', padding: 40, gap: 10 },
   emptyText: { color: colors.textMuted, textAlign: 'center' },
-  floatingActions: { position: 'absolute', right: 14, bottom: 14, gap: 10, alignItems: 'center' },
-  floatButton: { width: 50, height: 50, borderRadius: 25, backgroundColor: '#25D366', alignItems: 'center', justifyContent: 'center', elevation: 5 },
-  topButton: { width: 42, height: 42, backgroundColor: colors.white, borderWidth: 1, borderColor: colors.border },
 });
 
-function ProductShowcase({ title, subtitle, items, onPress, eyebrow }: { title: string; subtitle: string; items: Product[]; onPress: (p: Product) => void; eyebrow?: string }) {
+function ProductShowcase({ title, subtitle, items, onPress, onAddToCart, eyebrow, flashSale = false }: { title: string; subtitle: string; items: Product[]; onPress: (p: Product) => void; onAddToCart: (p: Product) => Promise<void>; eyebrow?: string; flashSale?: boolean }) {
+  const { isDark } = usePreferences();
   if (!items.length) return null;
   return <View style={{ marginBottom: 12 }}>
-    <View style={styles.shelfHeading}><View style={{ flex: 1 }}><Text style={styles.eyebrow}>{eyebrow ?? 'ERAVENDA PICKS'}</Text><Text style={styles.shelfTitle}>{title}</Text><Text style={styles.shelfSub}>{subtitle}</Text></View></View>
+    <View style={styles.shelfHeading}><View style={{ flex: 1 }}><Text style={styles.eyebrow}>{eyebrow ?? 'ERAVENDA PICKS'}</Text><Text style={[styles.shelfTitle, isDark && styles.shelfTitleDark]}>{title}</Text><Text style={[styles.shelfSub, isDark && styles.shelfSubDark]}>{subtitle}</Text></View></View>
     <FlatList horizontal data={items} keyExtractor={(p) => p.id} showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 8 }} renderItem={({ item }) => (
-      <Pressable onPress={() => onPress(item)} style={{ width: 142, marginHorizontal: 4, padding: 8, backgroundColor: colors.white, borderRadius: radius.md, ...shadow.card }}>
-        <Image source={{ uri: primaryImage(item) }} style={{ width: 126, height: 104, borderRadius: radius.sm, backgroundColor: colors.skeleton }} contentFit="cover" />
-        {discountPercent(item) > 0 && <Text style={{ color: colors.danger, fontSize: 10, fontWeight: '800', marginTop: 5 }}>FLASH · {discountPercent(item)}% OFF</Text>}
-        <Text numberOfLines={2} style={{ color: colors.text, fontSize: 12, fontWeight: '700', marginTop: 4 }}>{item.name}</Text>
+      <View style={[{ width: 150, marginHorizontal: 4, padding: 8, backgroundColor: colors.surface, borderRadius: radius.md, ...shadow.card }, isDark && { backgroundColor: '#17221D', shadowOpacity: 0.22 }]}>
+        <Pressable onPress={() => onPress(item)} accessibilityRole="button" accessibilityLabel={item.name}>
+        <Image source={{ uri: primaryImage(item) }} style={{ width: 134, height: 104, borderRadius: radius.sm, backgroundColor: colors.skeleton }} contentFit="cover" />
+        {flashSale && discountPercent(item) > 0 && <FlashLabel discount={discountPercent(item)} />}
+        <Text numberOfLines={2} style={{ color: isDark ? '#F0F5F2' : colors.text, fontSize: 12, fontWeight: '700', marginTop: 4 }}>{item.name}</Text>
         <Text style={{ color: colors.primary, fontWeight: '800', marginTop: 4 }}>{formatPrice(effectivePrice(item))}</Text>
-      </Pressable>
+        </Pressable>
+        <Pressable onPress={() => void onAddToCart(item)} style={styles.showcaseAdd} accessibilityRole="button" accessibilityLabel={`Add ${item.name} to cart`}><Ionicons name="cart-outline" size={14} color={colors.white} /><Text style={styles.showcaseAddText}>Add to Cart</Text></Pressable>
+      </View>
     )} />
   </View>;
+}
+
+function FlashLabel({ discount }: { discount: number }) {
+  const pulse = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const animation = Animated.loop(Animated.sequence([
+      Animated.timing(pulse, { toValue: 1.06, duration: 600, useNativeDriver: true }),
+      Animated.timing(pulse, { toValue: 1, duration: 600, useNativeDriver: true }),
+    ]));
+    animation.start();
+    return () => animation.stop();
+  }, [pulse]);
+  return <Animated.View style={[styles.showcaseFlash, { transform: [{ scale: pulse }] }]}><View style={styles.flashDot} /><Text style={styles.showcaseFlashText}>FLASH · {discount}% OFF</Text></Animated.View>;
 }
 
 function ProductFilters({ categories, selected, onSelect }: { categories: Category[]; selected: string; onSelect: (id: string) => void }) {

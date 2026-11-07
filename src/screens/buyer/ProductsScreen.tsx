@@ -7,7 +7,6 @@ import { Screen } from '../../components/Screen';
 import { Header } from '../../components/Section';
 import { SearchBar } from '../../components/SearchBar';
 import { colors, radius } from '../../config/theme';
-import { useAuth } from '../../context/AuthContext';
 import { useBlocks } from '../../context/BlockContext';
 import { useCart } from '../../context/CartContext';
 import type { RootStackParamList } from '../../navigation/types';
@@ -19,8 +18,7 @@ const PAGE_SIZE = 20;
 
 /** Dedicated equivalent of the web app's /products catalogue page. */
 export function ProductsScreen({ navigation, route }: Props) {
-  const { status } = useAuth();
-  const { wishlistIds, toggleWishlist } = useCart();
+  const { wishlistIds, toggleWishlist, addItem } = useCart();
   const { blockedIds } = useBlocks();
   const [categories, setCategories] = useState<Category[]>([]);
   const [categoryId, setCategoryId] = useState<string | null>(route.params?.categoryId ?? null);
@@ -85,9 +83,14 @@ export function ProductsScreen({ navigation, route }: Props) {
     await load(1, false);
     setRefreshing(false);
   };
-  const heart = async (id: string) => {
-    if (status !== 'signedIn') return navigation.navigate('Login');
-    try { await toggleWishlist(id); } catch (e: any) { Alert.alert('Wishlist', e.message); }
+  const heart = async (product: Product) => {
+    try { await toggleWishlist(product.id, product); } catch (e: any) { Alert.alert('Wishlist', e.message); }
+  };
+  const quickAdd = async (product: Product) => {
+    if (product.colors?.length || product.sizes?.length || product.options?.length) return navigation.navigate('ProductDetails', { productId: product.id });
+    const quantity = product.sales_type === 'wholesale' ? product.wholesale_min_quantity ?? 2 : 1;
+    try { await addItem({ product_id: product.id, quantity }, product); Alert.alert('Added to cart', product.name); }
+    catch (e: any) { Alert.alert('Could not add to cart', e.message || 'Please try again.'); }
   };
 
   return <Screen edges={['left', 'right', 'bottom']}>
@@ -114,7 +117,7 @@ export function ProductsScreen({ navigation, route }: Props) {
         />}
         <View style={styles.resultsHeading}><View><Text style={styles.kicker}>{salesType === 'retail' ? 'SHOP THE MARKETPLACE' : 'BULK BUYING'}</Text><Text style={styles.heading}>{query ? `Results for “${query}”` : title}</Text></View><Text style={styles.count}>{total} items</Text></View>
       </View>}
-      renderItem={({ item }) => <ProductCard product={item} wished={wishlistIds.has(item.id)} onPress={() => navigation.navigate('ProductDetails', { productId: item.id })} onToggleWishlist={() => void heart(item.id)} />}
+      renderItem={({ item }) => <ProductCard product={item} wished={wishlistIds.has(item.id)} onPress={() => navigation.navigate('ProductDetails', { productId: item.id })} onToggleWishlist={() => void heart(item)} onAddToCart={() => quickAdd(item)} />}
       ListEmptyComponent={loading ? <ActivityIndicator style={{ margin: 36 }} color={colors.primary} /> : <View style={styles.empty}><Ionicons name={error ? 'cloud-offline-outline' : 'search-outline'} size={38} color={colors.textMuted} /><Text style={styles.emptyText}>{error || 'No products found. Try another category or search.'}</Text></View>}
       ListFooterComponent={loadingMore ? <ActivityIndicator style={{ margin: 18 }} color={colors.primary} /> : undefined}
     />
@@ -126,12 +129,12 @@ const styles = StyleSheet.create({
   search: { paddingHorizontal: 14, paddingTop: 8 },
   modeRow: { flexDirection: 'row', marginHorizontal: 14, marginTop: 10, padding: 3, borderRadius: radius.pill, backgroundColor: colors.border },
   mode: { flex: 1, minHeight: 36, alignItems: 'center', justifyContent: 'center', borderRadius: radius.pill },
-  modeActive: { backgroundColor: colors.primary },
+  modeActive: { backgroundColor: colors.primaryButton },
   modeText: { color: colors.text, fontSize: 12, fontWeight: '700' },
   modeTextActive: { color: colors.white },
   categoryList: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 4, gap: 8 },
   categoryChip: { minHeight: 34, paddingHorizontal: 12, borderRadius: radius.pill, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.surface, alignItems: 'center', justifyContent: 'center' },
-  categoryChipActive: { backgroundColor: colors.primary, borderColor: colors.primary },
+  categoryChipActive: { backgroundColor: colors.primaryButton, borderColor: colors.primary },
   categoryText: { color: colors.text, fontSize: 11, fontWeight: '700' },
   categoryTextActive: { color: colors.white },
   resultsHeading: { marginHorizontal: 14, marginTop: 12, marginBottom: 4, flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' },

@@ -116,5 +116,5 @@ const styles = StyleSheet.create({
   logo: { width: 84, height: 84, borderRadius: 42 },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
   chip: { borderWidth: 1, borderColor: colors.border, borderRadius: radius.pill, paddingHorizontal: 12, paddingVertical: 7, backgroundColor: colors.surface },
-  chipOn: { backgroundColor: colors.primary, borderColor: colors.primary },
+  chipOn: { backgroundColor: colors.primaryButton, borderColor: colors.primary },
 });

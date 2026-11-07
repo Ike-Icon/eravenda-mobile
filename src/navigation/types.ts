@@ -6,6 +6,7 @@ export type RootStackParamList = {
   Products: { categoryId?: string | null; salesType?: 'retail' | 'wholesale' } | undefined;
   FollowedStores: undefined;
   Settings: undefined;
+  DeliveryPartner: undefined;
   FooterInfo: undefined;
   ProductDetails: { productId: string };
   Login: undefined;

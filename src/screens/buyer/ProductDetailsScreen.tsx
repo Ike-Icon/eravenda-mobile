@@ -8,11 +8,12 @@ import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Image } from 'expo-image';
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, ScrollView, Share, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { Button } from '../../components/Button';
 import { Screen } from '../../components/Screen';
 import { Skeleton } from '../../components/Skeleton';
 import { colors, font, radius } from '../../config/theme';
+import { SITE_ORIGIN } from '../../config/env';
 import { useAuth } from '../../context/AuthContext';
 import { useCart } from '../../context/CartContext';
 import type { RootStackParamList } from '../../navigation/types';
@@ -83,7 +84,7 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
   const base = optionPrices(selectedOption, effectivePrice(product));
   const unitPrice = selectedOption ? base.price : effectivePrice(product);
   const listPrice = selectedOption ? base.list : product.price;
-  const off = unitPrice < listPrice ? Math.round(((listPrice - unitPrice) / listPrice) * 100) : 0;
+  const discountPercentValue = unitPrice < listPrice ? Math.round(((listPrice - unitPrice) / listPrice) * 100) : 0;
   // Products sold by priced option show "from <cheapest option>" until the buyer picks one.
   const lowestOption = optionsList.filter((o) => o.available && o.price).sort((a, b) => optionPrices(a, 0).price - optionPrices(b, 0).price)[0];
   const wished = wishlistIds.has(product.id);
@@ -102,11 +103,10 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
   const needsChoice = (colorsList.some((c) => c.available) && !color) || (sizesList.some((s) => s.available) && !size) || (optionsList.some((o) => o.available) && !option);
 
   const add = async (thenGoToCart: boolean) => {
-    if (status !== 'signedIn') return navigation.navigate('Login');
     if (needsChoice) return Alert.alert('Choose options', 'Please select a colour, size or option first.');
     setBusy(thenGoToCart ? 'buy' : 'cart');
     try {
-      await addItem({ product_id: product.id, quantity: shownQty, color, size, option });
+      await addItem({ product_id: product.id, quantity: shownQty, color, size, option }, product);
       if (thenGoToCart) navigation.navigate('Tabs', { screen: 'Cart' } as never);
       else Alert.alert('Added to cart', product.name);
     } catch (e: any) {
@@ -117,11 +117,20 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
   };
 
   const heart = async () => {
-    if (status !== 'signedIn') return navigation.navigate('Login');
     try {
-      await toggleWishlist(product.id);
+      await toggleWishlist(product.id, product);
     } catch (e: any) {
       Alert.alert('Wishlist', e.message);
+    }
+  };
+
+  const shareProduct = async () => {
+    const url = `${SITE_ORIGIN}/product/${encodeURIComponent(product.id)}`;
+    const message = `Check out ${product.name} on Eravenda Market`;
+    try {
+      await Share.share(Platform.OS === 'ios' ? { title: product.name, message, url } : { title: product.name, message: `${message}\n${url}` });
+    } catch {
+      Alert.alert('Could not share product', 'Please try again.');
     }
   };
 
@@ -179,6 +188,9 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
           <Pressable onPress={heart} style={[styles.round, { right: 58 }]} accessibilityLabel="Toggle wishlist">
             <Ionicons name={wished ? 'heart' : 'heart-outline'} size={22} color={wished ? colors.danger : colors.text} />
           </Pressable>
+          <Pressable onPress={shareProduct} style={[styles.round, { right: 12 }]} accessibilityRole="button" accessibilityLabel="Share product">
+            <Ionicons name="share-social-outline" size={22} color={colors.text} />
+          </Pressable>
         </View>
 
         <View style={styles.body}>
@@ -191,8 +203,8 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
           <View style={styles.priceRow}>
             {showFrom && <Text style={styles.old}>from</Text>}
             <Text style={styles.price}>{formatPrice(showFrom ? optionPrices(lowestOption, 0).price : unitPrice)}</Text>
-            {off > 0 && !showFrom && <Text style={styles.old}>{formatPrice(listPrice)}</Text>}
-            {off > 0 && !showFrom && <Text style={styles.off}>-{off}%</Text>}
+            {discountPercentValue > 0 && !showFrom && <Text style={styles.old}>{formatPrice(listPrice)}</Text>}
+            {discountPercentValue > 0 && !showFrom && <Text style={styles.discountBadge}>-{discountPercentValue}%</Text>}
           </View>
           <Text style={[styles.stock, { color: available ? colors.success : colors.danger }]}>
             {available ? (product.stock_quantity <= 5 ? `Only ${product.stock_quantity} left` : 'In stock') : 'Out of stock'}
@@ -250,10 +262,10 @@ export function ProductDetailsScreen({ route, navigation }: Props) {
         </View>
       </ScrollView>
       {/* Sticky action bar */}
-      <Screen edges={['bottom']} style={styles.actions}>
+      <Screen edges={['bottom']} style={styles.actions} showFooter={false}>
         <View style={{ flexDirection: 'row', gap: 10, padding: 12 }}>
-          <Button title="Add to Cart" variant="outline" style={{ flex: 1 }} onPress={() => add(false)} loading={busy === 'cart'} disabled={!available || cannotMeetMin} />
-          <Button title="Buy Now" style={{ flex: 1 }} onPress={() => add(true)} loading={busy === 'buy'} disabled={!available || cannotMeetMin} />
+          <Button title="Add to Cart" icon="cart-outline" variant="outline" style={{ flex: 1 }} onPress={() => add(false)} loading={busy === 'cart'} disabled={!available || cannotMeetMin} />
+          <Button title="Buy Now" icon="flash-outline" style={{ flex: 1 }} onPress={() => add(true)} loading={busy === 'buy'} disabled={!available || cannotMeetMin} />
         </View>
       </Screen>
     </Screen>
@@ -271,7 +283,7 @@ const styles = StyleSheet.create({
   priceRow: { flexDirection: 'row', alignItems: 'baseline', gap: 10, marginTop: 8 },
   price: { fontSize: font.xxl, fontWeight: '800', color: colors.primary },
   old: { color: colors.textMuted, textDecorationLine: 'line-through' },
-  off: { color: colors.danger, fontWeight: '800' },
+  discountBadge: { color: colors.danger, fontWeight: '800' },
   stock: { marginTop: 6, fontWeight: '700' },
   note: { color: colors.textMuted, marginTop: 4, fontSize: font.sm },
   sectionLabel: { fontWeight: '700', color: colors.text, fontSize: font.md },
@@ -285,7 +297,7 @@ const styles = StyleSheet.create({
   reportText: { color: colors.textMuted, fontSize: 13, textDecorationLine: 'underline' },
   chipOff: { backgroundColor: colors.background, opacity: 0.7 },
   swatch: { width: 14, height: 14, borderRadius: 7, borderWidth: 1, borderColor: colors.border },
-  chipActive: { backgroundColor: colors.primary, borderColor: colors.primary },
+  chipActive: { backgroundColor: colors.primaryButton, borderColor: colors.primary },
   chipText: { color: colors.text },
   qtyRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 },
   stepper: { flexDirection: 'row', alignItems: 'center', gap: 14 },

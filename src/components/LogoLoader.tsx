@@ -42,5 +42,5 @@ const styles = StyleSheet.create({
   logo: { width: 46, height: 46 },
   label: { color: colors.textMuted, fontSize: 13, fontWeight: '700', marginTop: 18, letterSpacing: 0.2 },
   progressTrack: { width: 88, height: 3, overflow: 'hidden', borderRadius: 2, backgroundColor: colors.primarySoft, marginTop: 11 },
-  progressFill: { width: 34, height: 3, borderRadius: 2, backgroundColor: colors.primary },
+  progressFill: { width: 34, height: 3, borderRadius: 2, backgroundColor: colors.primaryButton },
 });

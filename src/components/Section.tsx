@@ -2,6 +2,7 @@ import React from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { colors, font, radius } from '../config/theme';
+import { usePreferences } from '../context/PreferencesContext';
 
 /** Tappable settings-style row used on Account and Seller dashboard. */
 export function MenuRow({ icon, label, onPress, hint, danger }: { icon: keyof typeof Ionicons.glyphMap; label: string; onPress: () => void; hint?: string; danger?: boolean }) {
@@ -18,14 +19,15 @@ export function MenuRow({ icon, label, onPress, hint, danger }: { icon: keyof ty
 }
 
 export function Header({ title, onBack }: { title: string; onBack?: () => void }) {
+  const { isDark } = usePreferences();
   return (
-    <View style={styles.header}>
+    <View style={[styles.header, isDark && styles.headerDark]}>
       {onBack ? (
         <Pressable onPress={onBack} hitSlop={10} accessibilityLabel="Back">
-          <Ionicons name="arrow-back" size={24} color={colors.text} />
+          <Ionicons name="arrow-back" size={24} color={isDark ? '#F0F5F2' : colors.text} />
         </Pressable>
       ) : null}
-      <Text numberOfLines={1} style={styles.title}>{title}</Text>
+      <Text numberOfLines={1} style={[styles.title, isDark && styles.titleDark]}>{title}</Text>
     </View>
   );
 }
@@ -35,5 +37,7 @@ const styles = StyleSheet.create({
   label: { fontSize: font.md, color: colors.text, fontWeight: '600' },
   hint: { fontSize: 12, color: colors.textMuted, marginTop: 2 },
   header: { minHeight: 54, flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 16, paddingVertical: 7, backgroundColor: colors.background },
+  headerDark: { backgroundColor: '#101714' },
   title: { flex: 1, fontSize: font.xl, fontWeight: '800', color: colors.text },
+  titleDark: { color: '#F0F5F2' },
 });

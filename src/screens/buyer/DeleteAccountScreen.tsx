@@ -130,6 +130,6 @@ const styles = StyleSheet.create({
   bullet: { color: colors.text, lineHeight: 20 },
   muted: { color: colors.textMuted, lineHeight: 20 },
   err: { color: colors.danger, padding: 4, lineHeight: 20 },
-  blockCard: { backgroundColor: '#FEF3C7', borderRadius: radius.md, padding: 14, gap: 10 },
-  blocker: { color: '#92400E', lineHeight: 20 },
+  blockCard: { backgroundColor: colors.warningSurface, borderRadius: radius.md, padding: 14, gap: 10 },
+  blocker: { color: colors.warningText, lineHeight: 20 },
 });

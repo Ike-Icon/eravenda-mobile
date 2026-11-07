@@ -111,7 +111,7 @@ export function AppDrawer({ visible, onClose, navigation }: Props) {
             {user.role === 'seller' && <MenuAction icon="grid-outline" label="My Store" onPress={() => goTab('Seller')} />}
             {user.role !== 'seller' && user.role !== 'admin' && <MenuAction icon="storefront-outline" label="Become a Seller" onPress={() => navigate(() => navigation.navigate('Store'))} />}
             {hasProfessionalProfile && <MenuAction icon="briefcase-outline" label="Pro Dashboard" onPress={() => navigate(() => navigation.navigate('HandymanDashboard'))} />}
-            {hasDeliveryProfile && <MenuAction icon="car-outline" label="Delivery Dashboard" onPress={() => openPage('/delivery/dashboard')} />}
+            {hasDeliveryProfile && <MenuAction icon="car-outline" label="Delivery Partner" onPress={() => navigate(() => navigation.navigate('DeliveryPartner'))} />}
             <MenuAction icon="receipt-outline" label="Orders" onPress={() => goTab('Orders')} />
             <MenuAction icon="heart-outline" label="Wishlist" onPress={() => navigate(() => navigation.navigate('Wishlist'))} />
             <MenuAction icon="cart-outline" label="Cart" onPress={() => goTab('Cart')} />
@@ -122,7 +122,7 @@ export function AppDrawer({ visible, onClose, navigation }: Props) {
           </> : <>
             <MenuAction icon="log-in-outline" label="Log in" onPress={() => navigate(() => navigation.navigate('Login'))} />
             <MenuAction icon="person-add-outline" label="Sign up" onPress={() => navigate(() => navigation.navigate('Register'))} />
-            <MenuAction icon="heart-outline" label="Wishlist" onPress={() => navigate(() => navigation.navigate('Login'))} />
+            <MenuAction icon="heart-outline" label="Wishlist" onPress={() => navigate(() => navigation.navigate('Wishlist'))} />
             <MenuAction icon="cart-outline" label="Cart" onPress={() => goTab('Cart')} />
             <MenuAction icon="settings-outline" label="Settings" onPress={() => navigate(() => navigation.navigate('Settings'))} />
           </>}
@@ -149,6 +149,7 @@ export function AppDrawer({ visible, onClose, navigation }: Props) {
           <MenuAction icon="pricetag-outline" label="Sell on EraVenda" onPress={() => status === 'signedIn' ? navigate(() => navigation.navigate('Store')) : navigate(() => navigation.navigate('Login'))} />
           <MenuAction icon="construct-outline" label="Hire a Handyman" onPress={() => navigate(() => navigation.navigate('HandymanHub'))} />
           <MenuAction icon="person-add-outline" label="Join as a Handyman" onPress={() => status === 'signedIn' ? navigate(() => navigation.navigate('HandymanRegister')) : navigate(() => navigation.navigate('Login'))} />
+          <MenuAction icon={hasDeliveryProfile ? 'car-outline' : 'bicycle-outline'} label={hasDeliveryProfile ? 'Delivery Partner Dashboard' : 'Become a Delivery Partner'} onPress={() => navigate(() => navigation.navigate('DeliveryPartner'))} />
           <MenuAction icon="information-circle-outline" label="About, help & more" onPress={() => navigate(() => navigation.navigate('FooterInfo'))} />
         </ScrollView>
       </Animated.View>
@@ -166,13 +167,13 @@ const styles = StyleSheet.create({
   drawer: { height: '100%', backgroundColor: colors.surface, borderTopRightRadius: 18, borderBottomRightRadius: 18, overflow: 'hidden', elevation: 18, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 16, shadowOffset: { width: 3, height: 0 } },
   drawerHeader: { height: 58, paddingHorizontal: 15, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border, gap: 10 },
   closeButton: { width: 38, height: 38, alignItems: 'center', justifyContent: 'center', borderRadius: 19 },
-  drawerBrand: { flexDirection: 'row', alignItems: 'center', gap: 7 }, drawerLogo: { width: 30, height: 30 }, brandText: { color: colors.primary, fontSize: 21, fontWeight: '900', letterSpacing: -0.4 },
+  drawerBrand: { flexDirection: 'row', alignItems: 'center', gap: 7 }, drawerLogo: { width: 30, height: 30 }, brandText: { color: colors.primary, fontSize: 21, fontWeight: '900', fontStyle: 'italic', letterSpacing: -0.5 },
   body: { paddingHorizontal: 15, paddingBottom: 22 },
   sectionHeading: { minHeight: 48, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border },
   sectionTitle: { color: colors.text, fontSize: 15, fontWeight: '800' },
   subGroup: { paddingLeft: 5, paddingBottom: 5, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border },
-  action: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: '#F0F1EF', paddingHorizontal: 4 }, actionPressed: { backgroundColor: colors.primarySoft }, actionLabel: { flex: 1, color: colors.text, fontSize: 14, fontWeight: '600' },
+  action: { minHeight: 44, flexDirection: 'row', alignItems: 'center', gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border, paddingHorizontal: 4 }, actionPressed: { backgroundColor: colors.primarySoft }, actionLabel: { flex: 1, color: colors.text, fontSize: 14, fontWeight: '600' },
   profile: { minHeight: 68, flexDirection: 'row', alignItems: 'center', gap: 11, marginBottom: 5, paddingHorizontal: 4 }, avatar: { width: 44, height: 44, borderRadius: 22, backgroundColor: colors.primarySoft }, avatarFallback: { width: 44, height: 44, borderRadius: 22, backgroundColor: colors.primarySoft, alignItems: 'center', justifyContent: 'center' }, avatarLetter: { fontSize: 18, color: colors.primary, fontWeight: '800' }, profileName: { color: colors.text, fontSize: 14, fontWeight: '800' }, profileEmail: { color: colors.textMuted, fontSize: 12, marginTop: 2 },
   headingSplit: { minHeight: 50, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 14, borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border }, seeAll: { color: colors.primary, fontSize: 12, fontWeight: '800' },
-  categoryGroup: { borderBottomWidth: StyleSheet.hairlineWidth, borderColor: '#F0F1EF' }, categoryRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center' }, categoryMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 }, expandButton: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' }, childCategories: { paddingLeft: 31, paddingBottom: 8, gap: 2 }, childLabel: { paddingVertical: 8, color: colors.textMuted, fontSize: 13 }, childAll: { color: colors.primary, fontWeight: '700' },
+  categoryGroup: { borderBottomWidth: StyleSheet.hairlineWidth, borderColor: colors.border }, categoryRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center' }, categoryMain: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 }, expandButton: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center' }, childCategories: { paddingLeft: 31, paddingBottom: 8, gap: 2 }, childLabel: { paddingVertical: 8, color: colors.textMuted, fontSize: 13 }, childAll: { color: colors.primary, fontWeight: '700' },
 });

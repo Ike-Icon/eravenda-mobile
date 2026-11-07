@@ -40,9 +40,9 @@ const styles = StyleSheet.create({
   step: { flex: 1, alignItems: 'center' },
   lineRow: { flexDirection: 'row', alignItems: 'center', width: '100%' },
   line: { flex: 1, height: 3, backgroundColor: colors.border },
-  lineDone: { backgroundColor: colors.primary },
+  lineDone: { backgroundColor: colors.primaryButton },
   dot: { width: 22, height: 22, borderRadius: 11, backgroundColor: colors.border, alignItems: 'center', justifyContent: 'center' },
-  dotDone: { backgroundColor: colors.primary },
+  dotDone: { backgroundColor: colors.primaryButton },
   label: { marginTop: 6, fontSize: 11, color: colors.textMuted },
   cancel: { flexDirection: 'row', gap: 8, alignItems: 'center' },
 });

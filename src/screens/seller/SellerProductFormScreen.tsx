@@ -214,7 +214,7 @@ const styles = StyleSheet.create({
   label: { fontSize: 13, fontWeight: '600', color: colors.text, marginBottom: 6 },
   seg: { flexDirection: 'row', backgroundColor: colors.border, borderRadius: 999, padding: 3, marginBottom: 14 },
   segBtn: { flex: 1, alignItems: 'center', paddingVertical: 9, borderRadius: 999 },
-  segOn: { backgroundColor: colors.primary },
+  segOn: { backgroundColor: colors.primaryButton },
   photoWrap: { marginRight: 10 },
   photo: { width: 84, height: 84, borderRadius: radius.md, backgroundColor: colors.skeleton },
   add: { alignItems: 'center', justifyContent: 'center', borderWidth: 1.5, borderStyle: 'dashed', borderColor: colors.primary, backgroundColor: colors.primarySoft },

@@ -10,12 +10,13 @@ import { Ionicons } from '@expo/vector-icons';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Image } from 'expo-image';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, Share, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../../components/Button';
 import { ProductCard } from '../../components/ProductCard';
 import { Screen } from '../../components/Screen';
 import { Header } from '../../components/Section';
 import { colors, font, radius } from '../../config/theme';
+import { SITE_ORIGIN } from '../../config/env';
 import { useAuth } from '../../context/AuthContext';
 import { useBlocks } from '../../context/BlockContext';
 import { useCart } from '../../context/CartContext';
@@ -30,7 +31,7 @@ const PAGE_SIZE = 20;
 export function StorefrontScreen({ route, navigation }: Props) {
   const { storeId } = route.params;
   const { status } = useAuth();
-  const { wishlistIds, toggleWishlist } = useCart();
+  const { wishlistIds, toggleWishlist, addItem } = useCart();
   const { blockedIds, block, unblock } = useBlocks();
 
   const [store, setStore] = useState<Store | null>(null);
@@ -118,9 +119,25 @@ export function StorefrontScreen({ route, navigation }: Props) {
       ? navigation.navigate('Report', { targetType: 'store', targetId: storeId, title: store?.store_name ?? 'Store', storeId })
       : navigation.navigate('Login');
 
-  const heart = async (id: string) => {
-    if (status !== 'signedIn') return navigation.navigate('Login');
-    try { await toggleWishlist(id); } catch (e: any) { Alert.alert('Wishlist', e.message); }
+  const shareStore = async () => {
+    const url = `${SITE_ORIGIN}/store/${encodeURIComponent(storeId)}`;
+    const message = `Visit ${store?.store_name ?? 'this store'} on Eravenda Market`;
+    try {
+      await Share.share(Platform.OS === 'ios' ? { title: store?.store_name ?? 'Eravenda store', message, url } : { title: store?.store_name ?? 'Eravenda store', message: `${message}\n${url}` });
+    } catch {
+      Alert.alert('Could not share store', 'Please try again.');
+    }
+  };
+
+  const heart = async (product: Product) => {
+    try { await toggleWishlist(product.id, product); } catch (e: any) { Alert.alert('Wishlist', e.message); }
+  };
+
+  const quickAdd = async (product: Product) => {
+    if (product.colors?.length || product.sizes?.length || product.options?.length) return navigation.push('ProductDetails', { productId: product.id });
+    const quantity = product.sales_type === 'wholesale' ? product.wholesale_min_quantity ?? 2 : 1;
+    try { await addItem({ product_id: product.id, quantity }, product); Alert.alert('Added to cart', product.name); }
+    catch (e: any) { Alert.alert('Could not add to cart', e.message || 'Please try again.'); }
   };
 
   if (error && !store) return <Screen><Header title="Store" onBack={() => navigation.goBack()} /><Text style={styles.err}>{error}</Text></Screen>;
@@ -137,6 +154,9 @@ export function StorefrontScreen({ route, navigation }: Props) {
             <Text style={styles.muted}>{[store.sub_town, store.city, store.region].filter(Boolean).join(', ')}</Text>
             <Text style={styles.muted}>{store.follower_count ?? 0} follower{(store.follower_count ?? 0) === 1 ? '' : 's'}</Text>
           </View>
+          <Pressable onPress={shareStore} style={styles.shareButton} accessibilityRole="button" accessibilityLabel={`Share ${store.store_name}`} hitSlop={8}>
+            <Ionicons name="share-social-outline" size={21} color={colors.primary} />
+          </Pressable>
         </View>
         {!!store.description && <Text style={styles.desc}>{store.description}</Text>}
         {/* Following your own store is rejected by the server with a clear message. */}
@@ -162,7 +182,7 @@ export function StorefrontScreen({ route, navigation }: Props) {
         onEndReached={onEnd}
         onEndReachedThreshold={0.5}
         renderItem={({ item }) => (
-          <ProductCard product={item} wished={wishlistIds.has(item.id)} onPress={() => navigation.push('ProductDetails', { productId: item.id })} onToggleWishlist={() => heart(item.id)} />
+          <ProductCard product={item} wished={wishlistIds.has(item.id)} onPress={() => navigation.push('ProductDetails', { productId: item.id })} onToggleWishlist={() => heart(item)} onAddToCart={() => quickAdd(item)} />
         )}
         ListEmptyComponent={
           loading ? <ActivityIndicator style={{ margin: 24 }} color={colors.primary} />
@@ -182,6 +202,7 @@ const styles = StyleSheet.create({
   card: { backgroundColor: colors.surface, margin: 6, borderRadius: radius.lg, padding: 14, gap: 10 },
   row: { flexDirection: 'row', gap: 12, alignItems: 'center' },
   logo: { width: 64, height: 64, borderRadius: 32, backgroundColor: colors.primarySoft },
+  shareButton: { width: 42, height: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.primarySoft },
   center: { alignItems: 'center', justifyContent: 'center' },
   name: { fontSize: font.xl, fontWeight: '800', color: colors.text },
   muted: { color: colors.textMuted, fontSize: 13 },

@@ -5,11 +5,12 @@
  * "Proceed to checkout" opens the Checkout screen.
  */
 import { Ionicons } from '@expo/vector-icons';
+import { useFocusEffect } from '@react-navigation/native';
 import type { BottomTabScreenProps } from '@react-navigation/bottom-tabs';
 import type { CompositeScreenProps } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { Image } from 'expo-image';
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Button } from '../../components/Button';
 import { Screen } from '../../components/Screen';
@@ -25,10 +26,16 @@ type Props = CompositeScreenProps<BottomTabScreenProps<TabParamList, 'Cart'>, Na
 
 export function CartScreen({ navigation }: Props) {
   const { status } = useAuth();
-  const { cart, loading, setQuantity, removeItem } = useCart();
+  const { cart, loading, refresh, setQuantity, removeItem } = useCart();
   const [busyId, setBusyId] = useState<string | null>(null);
+  const items = cart?.items ?? [];
+  const hasUnmergedGuestItems = status === 'signedIn' && items.some((item) => item.id.startsWith('guest:'));
 
-  if (status !== 'signedIn') {
+  useFocusEffect(useCallback(() => {
+    if (status === 'signedIn') void refresh().catch(() => undefined);
+  }, [refresh, status]));
+
+  if (status !== 'signedIn' && items.length === 0) {
     return (
       <Screen edges={['left', 'right']}>
         <View style={styles.empty}>
@@ -57,11 +64,11 @@ export function CartScreen({ navigation }: Props) {
       { text: 'Remove', style: 'destructive', onPress: () => run(item.id, () => removeItem(item.id)) },
     ]);
 
-  const items = cart?.items ?? [];
-
   return (
     <Screen edges={['left', 'right']}>
       <Text style={styles.title}>My Cart</Text>
+      {status !== 'signedIn' && <Text style={styles.guestNotice}>Your cart is saved on this device. Sign in to sync it and checkout.</Text>}
+      {hasUnmergedGuestItems && <Text style={styles.guestNotice}>Some saved items still need to sync. Check your connection and retry before checkout.</Text>}
       {loading && !cart ? (
         <ActivityIndicator style={{ marginTop: 40 }} color={colors.primary} />
       ) : items.length === 0 ? (
@@ -119,6 +126,7 @@ export function CartScreen({ navigation }: Props) {
           />
           <View style={styles.footer}>
             {!!cart?.wholesale_issues.length && <Text style={styles.warn}>Fix the wholesale items above to continue to checkout.</Text>}
+            {hasUnmergedGuestItems && <Button title="Retry cart sync" variant="outline" loading={loading} disabled={loading} onPress={() => void refresh().catch((e: any) => Alert.alert('Cart sync', e.message))} />}
             {cart?.items.some((i) => i.product.sales_type === 'wholesale') && cart.items.some((i) => i.product.sales_type !== 'wholesale') && (
               <Text style={styles.hint}>Wholesale and retail items are delivered as separate orders.</Text>
             )}
@@ -128,9 +136,9 @@ export function CartScreen({ navigation }: Props) {
             </View>
             <Text style={styles.hint}>Delivery fee is calculated at checkout.</Text>
             <Button
-              title="Proceed to checkout"
-              disabled={!!cart?.wholesale_issues.length}
-              onPress={() => navigation.navigate('Checkout')}
+              title={status === 'signedIn' ? 'Proceed to checkout' : 'Sign in to checkout'}
+              disabled={loading || hasUnmergedGuestItems || !!cart?.wholesale_issues.length}
+              onPress={() => status === 'signedIn' ? navigation.navigate('Checkout') : navigation.navigate('Login')}
             />
           </View>
         </>
@@ -141,6 +149,7 @@ export function CartScreen({ navigation }: Props) {
 
 const styles = StyleSheet.create({
   title: { fontSize: font.xl, fontWeight: '800', color: colors.text, marginHorizontal: 16, marginTop: 12 },
+  guestNotice: { fontSize: 12, lineHeight: 18, color: colors.primary, marginHorizontal: 16, marginTop: 6 },
   empty: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 14 },
   emptyTitle: { fontSize: font.lg, fontWeight: '700', color: colors.text },
   row: { flexDirection: 'row', gap: 12, backgroundColor: colors.surface, borderRadius: radius.lg, padding: 10, ...shadow.card },
@@ -157,7 +166,7 @@ const styles = StyleSheet.create({
   hint: { fontSize: 12, color: colors.textMuted },
   wholesaleTag: { alignSelf: 'flex-start', marginTop: 4, backgroundColor: colors.primarySoft, color: colors.primary, fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: 'hidden' },
   issue: { color: colors.danger, fontSize: 12, marginTop: 4 },
-  fix: { alignSelf: 'flex-start', marginTop: 6, backgroundColor: colors.primary, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
+  fix: { alignSelf: 'flex-start', marginTop: 6, backgroundColor: colors.primaryButton, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
   fixText: { color: colors.white, fontSize: 12, fontWeight: '700' },
   warn: { color: colors.danger, fontSize: font.sm },
 });

@@ -65,12 +65,12 @@ export function VerifyEmailBanner() {
 }
 
 const styles = StyleSheet.create({
-  box: { backgroundColor: '#FEF3C7', borderRadius: radius.md, padding: 12, marginHorizontal: 16, marginTop: 12, gap: 6 },
-  title: { fontWeight: '800', color: '#92400E' },
-  body: { color: '#92400E', fontSize: 13 },
+  box: { backgroundColor: colors.warningSurface, borderRadius: radius.md, padding: 12, marginHorizontal: 16, marginTop: 12, gap: 6 },
+  title: { fontWeight: '800', color: colors.warningText },
+  body: { color: colors.warningText, fontSize: 13 },
   note: { color: colors.success, fontSize: 13, fontWeight: '600' },
   row: { flexDirection: 'row', gap: 8, marginTop: 4 },
-  btn: { backgroundColor: colors.primary, borderRadius: radius.sm, paddingHorizontal: 12, paddingVertical: 9 },
+  btn: { backgroundColor: colors.primaryButton, borderRadius: radius.sm, paddingHorizontal: 12, paddingVertical: 9 },
   btnAlt: { backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.primary },
   btnText: { color: colors.white, fontWeight: '700', fontSize: 13 },
 });

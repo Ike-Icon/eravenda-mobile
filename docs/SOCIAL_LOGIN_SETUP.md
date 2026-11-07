@@ -23,3 +23,18 @@ Use the same Google Cloud project as the website. The web OAuth client ID is the
 - Cancel the chooser and confirm the app stays on the login screen without an error.
 
 If the Google button is missing, check that `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID` is nonempty in the build environment and restart/rebuild after changing it. If it is visible but native sign-in reports unavailable, use a development build instead of Expo Go.
+
+## Android `DEVELOPER_ERROR` (code 10)
+
+The app passes the Web OAuth client ID to `GoogleSignin.configure()`. `DEVELOPER_ERROR` means Google's server-side Android OAuth configuration does not match the installed app; it is not fixed by changing the sign-in button or rebuilding with the same signing key.
+
+For an EAS-installed APK:
+
+1. From the project root, run `npx eas-cli credentials -p android` and select the profile used to build the installed APK (for example, `preview`). Note its **SHA-1** certificate fingerprint. Do not use SHA-256.
+2. In the same Google Cloud project that owns `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID`, create or correct an OAuth client of type **Android** with package name `com.eravenda.market` and that SHA-1.
+3. Confirm `GoogleSignin.configure({ webClientId })` uses the OAuth client of type **Web**. This app currently does that through `EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID`.
+4. Rebuild and reinstall only if the package ID, signing key, or build configuration changed. OAuth client updates usually apply to the existing install after Google propagates them.
+
+If the app was installed from Google Play, also add the **App signing key certificate SHA-1** shown in Play Console under the app's App integrity/App signing page. Play Store signs the installed app with that certificate, which may differ from the EAS upload key. For each different build signing key (development, preview/production EAS, and Play App Signing), register a matching Android OAuth client with the same package name.
+
+The package name configured for this app is `com.eravenda.market` (`app.json`).
